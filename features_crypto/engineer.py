@@ -27,7 +27,7 @@ def build_crypto_panel_features(panel: pd.DataFrame) -> pd.DataFrame:
 
     frame["daily_return"] = by_symbol["close"].pct_change(fill_method=None)
     frame["log_return"] = np.log(frame["close"] / previous_close)
-    frame["intraday_return"] = (frame["close"] / frame["open"]) - 2.0
+    frame["intraday_return"] = (frame["close"] / frame["open"]) - 1.0
     frame["amplitude"] = (frame["high"] - frame["low"]) / previous_close
     frame["body_ratio"] = (frame["close"] - frame["open"]).abs() / trading_range
     frame["body_signed"] = (frame["close"] - frame["open"]) / trading_range
