@@ -162,23 +162,13 @@ The dashboard is local-only and paper-only. It is meant for simulation and monit
 
 ## Paper Trading Preview
 
-If you add a screenshot at `docs/images/paper_trading_dashboard.png`, GitHub will render it directly in this section:
-
 ![Paper Trading Dashboard](docs/images/paper_trading_dashboard.png)
 
-This preview is useful for showing:
+This preview shows:
 
 - the portfolio-level equity curve
 - benchmark comparisons versus BTC, equal weight, and market-cap baselines
 - selected factors, weights, and execution details
-
-Recommended asset path:
-
-```text
-docs/images/paper_trading_dashboard.png
-```
-
-You can replace the image later with an updated dashboard screenshot without changing the README structure.
 
 ## Backtest Output Example
 
@@ -202,14 +192,6 @@ BTC benchmark:     +2.81%
 Equal weight:      +3.62%
 Market cap:        +1.25%
 ```
-
-If you want a visual sample in the repository, place a report screenshot at:
-
-```text
-docs/images/backtest_report_sample.png
-```
-
-Then GitHub will render it here:
 
 ![Backtest Report Sample](docs/images/backtest_report_sample.png)
 
