@@ -34,7 +34,9 @@ from data_crypto.loader import (
     load_crypto_universe_csv,
 )
 from features_crypto.engineer import build_crypto_panel_features, engineered_crypto_feature_columns
+from utils.experiment_manifest import ExperimentManifest, create_experiment_directory
 from utils.io import ensure_dir, write_json
+from utils.random_state import set_global_seed
 
 
 DEFAULT_OUTPUT_DIR = Path("reports") / "crypto_alpha_workflow"
@@ -150,7 +152,19 @@ def main() -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     warnings.filterwarnings("ignore", message="An input array is constant; the correlation coefficient is not defined.")
     args = parse_args()
-    output_dir = ensure_dir(args.output_dir)
+    set_global_seed(args.seed)
+    output_dir = create_experiment_directory(args.output_dir)
+    ensure_dir(output_dir / "factors")
+    ensure_dir(output_dir / "backtest")
+    logs_dir = ensure_dir(output_dir / "logs")
+    manifest = ExperimentManifest(
+        output_dir,
+        random_seed=args.seed,
+        configuration_path=args.fitness_config,
+        input_paths=workflow_input_paths(args),
+    )
+    manifest.save()
+    write_text(logs_dir / "workflow.log", "status=running\n")
     total_steps = 7
     print_terminal_progress(1, total_steps, "Loading Local Data", f"Output dir: {output_dir.resolve()}")
 
@@ -159,6 +173,8 @@ def main() -> None:
     btc_benchmark_df = load_or_build_btc_benchmark(args, panel)
     equal_weight_benchmark_df = build_equal_weight_benchmark(panel, benchmark_name="crypto30_equal_weight")
     market_cap_benchmark_df = load_or_build_market_cap_benchmark(args, panel, universe)
+    manifest.set_dataset_metadata(build_dataset_metadata(panel))
+    manifest.save()
     print_info(
         "Loaded panel with "
         f"{int(panel['symbol'].astype(str).nunique())} symbols and "
@@ -198,7 +214,10 @@ def main() -> None:
         save_registry=True,
         universe_symbols=config.universe_symbols,
     )
-    write_json(output_dir / "workflow_config.json", to_jsonable(asdict(config)))
+    config_payload = to_jsonable(asdict(config))
+    write_json(output_dir / "workflow_config.json", config_payload)
+    manifest.set_config(portable_config_snapshot(config_payload))
+    manifest.save()
     print_terminal_progress(2, total_steps, "Preparing Splits And Config")
 
     research_panel = slice_panel_by_date(
@@ -287,6 +306,7 @@ def main() -> None:
     backtest_equal_weight = summarize_market_baseline(equal_weight_benchmark_df, result["date"], args.initial_capital)
     backtest_market_cap = summarize_market_baseline(market_cap_benchmark_df, result["date"], args.initial_capital)
     write_json(output_dir / "backtest" / "backtest_metrics.json", to_jsonable(metrics))
+    write_json(output_dir / "metrics.json", to_jsonable(metrics))
     write_json(output_dir / "backtest" / "backtest_vs_btc.json", to_jsonable(backtest_btc))
     write_json(output_dir / "backtest" / "backtest_vs_equal_weight.json", to_jsonable(backtest_equal_weight))
     write_json(output_dir / "backtest" / "backtest_vs_market_cap.json", to_jsonable(backtest_market_cap))
@@ -309,6 +329,7 @@ def main() -> None:
             ),
         ),
     )
+
     backtest_report_path = output_dir / "backtest" / "backtest_report.md"
     print_terminal_progress(
         7,
@@ -347,6 +368,17 @@ def main() -> None:
         ),
     )
 
+    generated_factor_count = sum(
+        int(window.get("new_candidate_count", 0))
+        for window in rolling_workflow["rolling_summary"].get("windows", [])
+    )
+    manifest.set_research_results(
+        generated_factor_count=generated_factor_count,
+        selected_factors=[factor.expression for factor in selected],
+    )
+    manifest.save(status="completed")
+    write_text(logs_dir / "workflow.log", "status=completed\n")
+
     print("Crypto rolling-pool workflow complete.")
     print(f"Output dir: {output_dir.resolve()}")
     print(f"Selected factors: {len(selected)}")
@@ -368,6 +400,43 @@ def load_or_build_crypto_panel(args: argparse.Namespace) -> pd.DataFrame:
         raise ValueError("No rows remain after applying the crypto universe filter.")
     panel = build_crypto_panel_features(panel)
     return panel.reset_index(drop=True)
+
+
+def workflow_input_paths(args: argparse.Namespace) -> list[str]:
+    return [
+        str(path)
+        for path in (
+            args.panel_csv,
+            args.panel_dir,
+            args.universe_csv,
+            args.btc_benchmark_csv,
+            args.market_cap_benchmark_csv,
+            args.fitness_config,
+        )
+        if path
+    ]
+
+
+def build_dataset_metadata(panel: pd.DataFrame) -> dict[str, Any]:
+    dates = pd.to_datetime(panel["date"], utc=False)
+    return {
+        "row_count": int(len(panel)),
+        "column_count": int(len(panel.columns)),
+        "columns": [str(column) for column in panel.columns],
+        "symbol_count": int(panel["symbol"].astype(str).nunique()),
+        "date_min": str(dates.min()),
+        "date_max": str(dates.max()),
+    }
+
+
+def portable_config_snapshot(config_payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove run-directory identity while preserving every research parameter."""
+
+    snapshot = json.loads(json.dumps(config_payload))
+    registry = snapshot.get("registry")
+    if isinstance(registry, dict) and "directory" in registry:
+        registry["directory"] = "alpha_mining_registry"
+    return snapshot
 
 
 def load_or_build_btc_benchmark(args: argparse.Namespace, panel: pd.DataFrame) -> pd.DataFrame:
@@ -871,7 +940,10 @@ def merge_fitness_config(base: FitnessConfig, override: FitnessConfig | None) ->
 
 
 def write_selected_factors(output_dir: Path, selected: list[Any]) -> None:
-    pd.DataFrame([factor.summary_row() for factor in selected]).to_csv(output_dir / "selected_factors_summary.csv", index=False)
+    summary = pd.DataFrame([factor.summary_row() for factor in selected])
+    summary.to_csv(output_dir / "selected_factors_summary.csv", index=False)
+    factors_dir = ensure_dir(output_dir / "factors")
+    summary.to_csv(factors_dir / "selected_factors_summary.csv", index=False)
 
 
 def refine_selected_factors_before_backtest(

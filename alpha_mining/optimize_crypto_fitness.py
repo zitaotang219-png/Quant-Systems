@@ -10,6 +10,8 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from utils.random_state import set_global_seed
+
 from alpha_mining import (
     FitnessConfig,
     backtest_selected_factors,
@@ -75,6 +77,7 @@ def main() -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     warnings.filterwarnings("ignore", message="An input array is constant; the correlation coefficient is not defined.")
     args = parse_args()
+    set_global_seed(args.seed)
     output_dir = Path(args.output_dir)
     final_output_dir = Path(args.final_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
