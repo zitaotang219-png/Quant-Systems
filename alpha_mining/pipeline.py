@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 
 from backtest.engine import BacktestEngine
+from backtest.event_driven import EventDrivenPortfolioBacktester
+from backtest.portfolio_constraints import PortfolioConstraints
+from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
+from execution.cost_model import TransactionCostModel
 
 from .config import AlphaMiningConfig, SelectedFactor
 from .evaluator import (
@@ -26,6 +30,12 @@ from .registry import FactorRegistry
 class PortfolioBacktestResult:
     timeseries: pd.DataFrame
     weights: pd.DataFrame
+    trades: pd.DataFrame | None = None
+    reconciliation: pd.DataFrame | None = None
+    turnover_report: pd.DataFrame | None = None
+    constraint_report: pd.DataFrame | None = None
+    events: list[dict[str, Any]] | None = None
+    trading_convention: dict[str, Any] | None = None
 
 
 @dataclass
@@ -72,6 +82,7 @@ class AlphaMiningStrategy:
         panel: pd.DataFrame,
         initial_capital: float,
         transaction_cost_bps: float,
+        slippage_bps: float = 0.0,
         regime_source_panel: pd.DataFrame | None = None,
     ) -> PortfolioBacktestResult:
         panel = _filter_universe(panel, self.universe_symbols)
@@ -91,31 +102,6 @@ class AlphaMiningStrategy:
             prepared if regime_source_panel is None else _filter_universe(regime_source_panel, self.universe_symbols),
             self.regime_config,
         )
-        combined = combine_factor_columns(
-            factor_columns=factor_columns,
-            selected_factors=self.selected_factors,
-            weight_scheme=self.factor_weight_scheme,
-            dates=prepared["date"],
-            regime_by_date=regime_by_date,
-            regime_config=self.regime_config,
-        )
-        portfolio = self.evaluator._simulate_long_short_portfolio(prepared, combined)  # noqa: SLF001
-        equity_curve = initial_capital * (1.0 + portfolio["daily_return"]).cumprod()
-        running_peak = equity_curve.cummax()
-        drawdown = (equity_curve / running_peak) - 1.0
-        portfolio_timeseries = pd.DataFrame(
-            {
-                "date": portfolio["date"],
-                "gross_return": portfolio["gross_return"],
-                "transaction_cost": portfolio["transaction_cost"],
-                "net_return": portfolio["daily_return"],
-                "equity_curve": equity_curve,
-                "drawdown": drawdown,
-                "turnover": portfolio["turnover"],
-                "pnl": initial_capital * portfolio["daily_return"],
-            }
-        )
-
         weights = _build_combined_weights(
             panel=prepared,
             factor_columns=factor_columns,
@@ -139,7 +125,31 @@ class AlphaMiningStrategy:
             regime_by_date=regime_by_date,
             regime_config=self.regime_config,
         )
-        return PortfolioBacktestResult(timeseries=portfolio_timeseries, weights=weights)
+        backtester = EventDrivenPortfolioBacktester(
+            initial_capital=initial_capital,
+            cost_model=TransactionCostModel(
+                commission_bps=transaction_cost_bps,
+                slippage_bps=slippage_bps,
+            ),
+            constraints=PortfolioConstraints(
+                max_position_size=self.position_limit,
+                max_leverage=self.gross_leverage,
+                max_gross_exposure=self.gross_leverage,
+                max_net_exposure=self.gross_leverage,
+            ),
+            convention=DEFAULT_TRADING_CONVENTION,
+        )
+        accounting = backtester.run(prepared, weights)
+        return PortfolioBacktestResult(
+            timeseries=accounting.timeseries,
+            weights=weights,
+            trades=accounting.trades,
+            reconciliation=accounting.reconciliation,
+            turnover_report=accounting.turnover,
+            constraint_report=accounting.constraints,
+            events=accounting.events,
+            trading_convention=DEFAULT_TRADING_CONVENTION.to_dict(),
+        )
 
     def target_weights(self, panel: pd.DataFrame) -> dict[str, float]:
         panel = _filter_universe(panel, self.universe_symbols)

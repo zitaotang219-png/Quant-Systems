@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
+
 from .config import FitnessConfig
 from .dsl import FactorNode
 from .portfolio_construction import build_weight_frame
@@ -365,9 +367,10 @@ def _prepare_panel(panel: pd.DataFrame, future_return_horizon: int) -> pd.DataFr
     prepared = prepared.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
     for column in ["open", "high", "low", "close", "volume"]:
         prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
-    next_open = prepared.groupby("symbol", sort=False)["open"].shift(-1)
-    exit_close = prepared.groupby("symbol", sort=False)["close"].shift(-future_return_horizon)
-    prepared["future_return"] = (exit_close / next_open) - 1.0
+    prepared["future_return"] = DEFAULT_TRADING_CONVENTION.forward_return(
+        prepared,
+        holding_bars=future_return_horizon,
+    )
     return prepared
 
 

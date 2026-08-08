@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 from pathlib import Path
 from typing import Any
 
@@ -81,7 +82,8 @@ class BacktestEngine:
         portfolio = strategy.backtest(
             panel=panel,
             initial_capital=self.initial_capital,
-            transaction_cost_bps=self.transaction_cost_bps + self.slippage_bps,
+            transaction_cost_bps=self.transaction_cost_bps,
+            slippage_bps=self.slippage_bps,
             **(strategy_backtest_kwargs or {}),
         )
         result = portfolio.timeseries.copy()
@@ -279,6 +281,28 @@ def _build_cross_sectional_artifacts(
     portfolio.weights.to_csv(weights_path, index=False)
     artifacts["timeseries_path"] = str(timeseries_path)
     artifacts["weights_path"] = str(weights_path)
+    for attribute, filename, key in (
+        ("trades", "trade_ledger.csv", "trade_ledger_path"),
+        ("reconciliation", "accounting_reconciliation.csv", "accounting_reconciliation_path"),
+        ("turnover_report", "turnover_report.csv", "turnover_report_path"),
+        ("constraint_report", "constraint_report.csv", "constraint_report_path"),
+    ):
+        frame = getattr(portfolio, attribute, None)
+        if isinstance(frame, pd.DataFrame):
+            path = output_path / filename
+            frame.to_csv(path, index=False)
+            artifacts[key] = str(path)
+    convention = getattr(portfolio, "trading_convention", None)
+    if convention:
+        artifacts["trading_convention"] = convention
+        convention_path = output_path / "trading_convention.json"
+        convention_path.write_text(json.dumps(convention, indent=2), encoding="utf-8")
+        artifacts["trading_convention_path"] = str(convention_path)
+    events = getattr(portfolio, "events", None)
+    if events is not None:
+        events_path = output_path / "event_log.json"
+        events_path.write_text(json.dumps(events, indent=2, default=str), encoding="utf-8")
+        artifacts["event_log_path"] = str(events_path)
     return artifacts
 
 
@@ -330,6 +354,9 @@ def _compute_cross_sectional_metrics(result: pd.DataFrame) -> dict[str, float]:
             "annual_return": 0.0,
             "sharpe": 0.0,
             "turnover": 0.0,
+            "gross_return": 0.0,
+            "net_return": 0.0,
+            "total_cost": 0.0,
             "max_drawdown": 0.0,
         }
 
@@ -350,6 +377,9 @@ def _compute_cross_sectional_metrics(result: pd.DataFrame) -> dict[str, float]:
         "sharpe": sharpe,
         "turnover": float(daily["turnover"].mean() * 252.0),
         "max_drawdown": float(-daily["drawdown"].min()),
+        "gross_return": float((1.0 + daily["gross_return"]).prod() - 1.0),
+        "net_return": total_return,
+        "total_cost": float(daily["total_cost"].sum()) if "total_cost" in daily else float(daily["transaction_cost"].sum() * initial_equity),
     }
 
 

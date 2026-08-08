@@ -25,6 +25,8 @@ def load_crypto_benchmark_csv(path: str | Path, benchmark_name: str | None = Non
     benchmark["date"] = pd.to_datetime(benchmark["date"], utc=False)
     if "close" in benchmark.columns:
         benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
+    if "open" in benchmark.columns:
+        benchmark["open"] = pd.to_numeric(benchmark["open"], errors="coerce")
     if "return" in benchmark.columns:
         benchmark["return"] = pd.to_numeric(benchmark["return"], errors="coerce")
     if benchmark_name:

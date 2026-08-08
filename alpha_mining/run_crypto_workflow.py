@@ -441,7 +441,11 @@ def portable_config_snapshot(config_payload: dict[str, Any]) -> dict[str, Any]:
 
 def load_or_build_btc_benchmark(args: argparse.Namespace, panel: pd.DataFrame) -> pd.DataFrame:
     if args.btc_benchmark_csv:
-        return load_crypto_benchmark_csv(args.btc_benchmark_csv, benchmark_name=args.benchmark_name)
+        benchmark = load_crypto_benchmark_csv(args.btc_benchmark_csv, benchmark_name=args.benchmark_name)
+        if "return" in benchmark.columns or "open" in benchmark.columns:
+            return benchmark
+        # A close-only series is not comparable with this workflow's next-open to close return.
+        return build_symbol_benchmark(panel, symbol="BTCUSDT", benchmark_name=args.benchmark_name)
     return build_symbol_benchmark(panel, symbol="BTCUSDT", benchmark_name=args.benchmark_name)
 
 
@@ -451,7 +455,10 @@ def load_or_build_market_cap_benchmark(
     universe: list[dict[str, str]],
 ) -> pd.DataFrame:
     if args.market_cap_benchmark_csv:
-        return load_crypto_benchmark_csv(args.market_cap_benchmark_csv, benchmark_name="crypto30_market_cap_weighted")
+        benchmark = load_crypto_benchmark_csv(args.market_cap_benchmark_csv, benchmark_name="crypto30_market_cap_weighted")
+        if "return" in benchmark.columns or "open" in benchmark.columns:
+            return benchmark
+        return build_market_cap_benchmark(panel, universe, benchmark_name="crypto30_market_cap_weighted")
     return build_market_cap_benchmark(panel, universe, benchmark_name="crypto30_market_cap_weighted")
 
 
@@ -465,13 +472,14 @@ def build_equal_weight_benchmark(panel: pd.DataFrame, benchmark_name: str) -> pd
     ordered = panel.copy()
     ordered["date"] = pd.to_datetime(ordered["date"], utc=False)
     ordered = ordered.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
-    daily_return = ordered.groupby("date", sort=False)["daily_return"].mean().fillna(0.0)
+    ordered["intraday_return"] = (ordered["close"] / ordered["open"]) - 1.0
+    daily_return = ordered.groupby("date", sort=False)["intraday_return"].mean().fillna(0.0)
     close = 100.0 * (1.0 + daily_return).cumprod()
-    return pd.DataFrame({"date": daily_return.index, "close": close.to_numpy(dtype=float), "name": benchmark_name})
+    return pd.DataFrame({"date": daily_return.index, "return": daily_return.to_numpy(dtype=float), "close": close.to_numpy(dtype=float), "name": benchmark_name})
 
 
 def build_symbol_benchmark(panel: pd.DataFrame, symbol: str, benchmark_name: str) -> pd.DataFrame:
-    frame = panel.loc[panel["symbol"].astype(str).str.upper() == str(symbol).upper(), ["date", "close"]].copy()
+    frame = panel.loc[panel["symbol"].astype(str).str.upper() == str(symbol).upper(), ["date", "open", "close"]].copy()
     if frame.empty:
         raise ValueError(f"Could not derive benchmark for symbol {symbol} from panel.")
     frame["name"] = benchmark_name
@@ -502,12 +510,12 @@ def build_market_cap_benchmark(
     ordered["date"] = pd.to_datetime(ordered["date"], utc=False)
     ordered = ordered.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
     ordered["future_weight"] = ordered["symbol"].astype(str).str.upper().map(normalized).fillna(0.0)
-    ordered["daily_return"] = ordered.groupby("symbol", sort=False)["close"].pct_change(fill_method=None)
+    ordered["intraday_return"] = (ordered["close"] / ordered["open"]) - 1.0
     weighted = ordered.groupby("date", sort=False).apply(
-        lambda day: float((day["daily_return"].fillna(0.0) * day["future_weight"]).sum())
+        lambda day: float((day["intraday_return"].fillna(0.0) * day["future_weight"]).sum())
     )
     close = 100.0 * (1.0 + weighted).cumprod()
-    return pd.DataFrame({"date": weighted.index, "close": close.to_numpy(dtype=float), "name": benchmark_name})
+    return pd.DataFrame({"date": weighted.index, "return": weighted.to_numpy(dtype=float), "close": close.to_numpy(dtype=float), "name": benchmark_name})
 
 
 def build_crypto_workflow_config(
@@ -1098,6 +1106,9 @@ def summarize_market_baseline(
         return {"final_equity": float(initial_capital), "total_return": 0.0}
     if "return" in benchmark.columns:
         daily_return = pd.to_numeric(benchmark["return"], errors="coerce").fillna(0.0)
+    elif {"open", "close"}.issubset(benchmark.columns):
+        daily_return = (pd.to_numeric(benchmark["close"], errors="coerce") / pd.to_numeric(benchmark["open"], errors="coerce")) - 1.0
+        daily_return = daily_return.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     else:
         daily_return = pd.to_numeric(benchmark["close"], errors="coerce").pct_change(fill_method=None).fillna(0.0)
     equity = float(initial_capital) * (1.0 + daily_return).cumprod()

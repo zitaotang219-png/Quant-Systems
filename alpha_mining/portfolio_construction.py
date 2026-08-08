@@ -273,6 +273,7 @@ def build_weight_frame(
             target=target,
             symbols=frame.loc[day_index, "symbol"].astype(str),
             regime_label=regime_label,
+            position_limit=position_limit,
             gross_leverage=gross_leverage,
             market_neutral=market_neutral,
             benchmark_follow_enabled=benchmark_follow_enabled,
@@ -351,6 +352,7 @@ def latest_weights_from_history(
         target=target,
         symbols=ordered.loc[latest_index, "symbol"].astype(str),
         regime_label=regime_label,
+        position_limit=position_limit,
         gross_leverage=gross_leverage,
         market_neutral=market_neutral,
         benchmark_follow_enabled=benchmark_follow_enabled,
@@ -422,6 +424,7 @@ def latest_weights_from_snapshot(
         target=target,
         symbols=symbols.astype(str),
         regime_label=regime_label,
+        position_limit=position_limit,
         gross_leverage=gross_leverage,
         market_neutral=market_neutral,
         benchmark_follow_enabled=benchmark_follow_enabled,
@@ -579,6 +582,7 @@ def _apply_benchmark_follow_overlay(
     target: pd.Series,
     symbols: pd.Series,
     regime_label: str | None,
+    position_limit: float,
     gross_leverage: float,
     market_neutral: bool,
     benchmark_follow_enabled: bool,
@@ -608,4 +612,5 @@ def _apply_benchmark_follow_overlay(
     combined = (((1.0 - blend) * target.astype(float)) + (blend * overlay)).astype(float)
     if market_neutral and abs(direction) < 1e-12:
         combined = combined - float(combined.mean())
-    return _weights_from_signal(combined, position_limit=max(gross_leverage, 0.0), gross_leverage=gross_leverage)
+    # Reapply the configured single-name limit after blending in the benchmark overlay.
+    return _weights_from_signal(combined, position_limit=position_limit, gross_leverage=gross_leverage)
