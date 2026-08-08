@@ -122,3 +122,16 @@ class TradeLedger:
                 "reason": reason,
             }
         )
+
+
+@dataclass
+class PortfolioLedger:
+    """The complete reconstructable state of a portfolio simulation."""
+
+    cash: CashLedger
+    positions: PositionLedger = field(default_factory=PositionLedger)
+    trades: TradeLedger = field(default_factory=TradeLedger)
+
+    @property
+    def equity(self) -> float:
+        return self.cash.balance + self.positions.market_value

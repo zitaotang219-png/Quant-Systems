@@ -624,7 +624,6 @@ def _apply_regression_weights(
         return factors
     prepared = _prepare_panel(
         calibration_panel,
-        future_return_horizon=config.evaluation.future_return_horizon,
     )
     feature_map: dict[str, pd.Series] = {}
     explicit_map: dict[str, bool] = {}

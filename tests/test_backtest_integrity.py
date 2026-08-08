@@ -56,8 +56,8 @@ def test_cash_position_consistency() -> None:
 def test_turnover_calculation() -> None:
     result = _backtester().run(_panel(), _weights(0.5))
     assert (result.turnover["entry_turnover"] == 0.5).all()
-    assert (result.turnover["exit_turnover"] == 0.5).all()
-    assert (result.turnover["turnover"] == 1.0).all()
+    assert result.turnover["exit_turnover"].tolist() == pytest.approx([0.55, 0.5])
+    assert result.turnover["turnover"].tolist() == pytest.approx([1.05, 1.0])
 
 
 def test_transaction_cost_application() -> None:
@@ -73,7 +73,7 @@ def test_no_same_bar_execution_bias() -> None:
     result = _backtester().run(_panel(), weights)
     # The price spike on Jan 2 is traded using only the Jan 1 signal; Jan 2's signal executes Jan 3.
     assert result.timeseries.iloc[0]["signal_date"] == pd.Timestamp("2024-01-01")
-    assert result.timeseries.iloc[0]["turnover"] == pytest.approx(1.0)
+    assert result.timeseries.iloc[0]["turnover"] == pytest.approx(1.05)
     assert result.timeseries.iloc[1]["signal_date"] == pd.Timestamp("2024-01-02")
 
 

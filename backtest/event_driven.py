@@ -9,10 +9,11 @@ import numpy as np
 import pandas as pd
 
 from backtest.events import AccountingEvent, FillEvent, MarketEvent, OrderEvent, PositionEvent, SignalEvent, event_to_dict
-from backtest.ledger import CashLedger, PositionLedger, TradeLedger
+from backtest.ledger import CashLedger, PortfolioLedger
 from backtest.portfolio_constraints import PortfolioConstraints, validate_target_weights
 from backtest.reconciliation import build_reconciliation_frame
 from backtest.trading_convention import DEFAULT_TRADING_CONVENTION, TradingConvention
+from backtest.turnover import DEFAULT_TURNOVER_CONVENTION, TurnoverConvention
 from execution.cost_model import TransactionCostModel
 
 
@@ -24,6 +25,7 @@ class EventDrivenBacktestResult:
     turnover: pd.DataFrame
     constraints: pd.DataFrame
     events: list[dict[str, Any]]
+    ledger: PortfolioLedger
 
 
 class EventDrivenPortfolioBacktester:
@@ -36,11 +38,13 @@ class EventDrivenPortfolioBacktester:
         cost_model: TransactionCostModel,
         constraints: PortfolioConstraints,
         convention: TradingConvention = DEFAULT_TRADING_CONVENTION,
+        turnover_convention: TurnoverConvention = DEFAULT_TURNOVER_CONVENTION,
     ) -> None:
         self.initial_capital = float(initial_capital)
         self.cost_model = cost_model
         self.constraints = constraints
         self.convention = convention
+        self.turnover_convention = turnover_convention
 
     def run(self, panel: pd.DataFrame, target_weights: pd.DataFrame) -> EventDrivenBacktestResult:
         required = {"date", "symbol", "open", "close"}
@@ -67,9 +71,10 @@ class EventDrivenPortfolioBacktester:
             date: group.set_index("symbol")["weight"].to_dict()
             for date, group in signals.groupby("date", sort=False)
         }
-        cash = CashLedger(balance=self.initial_capital)
-        positions = PositionLedger()
-        trades = TradeLedger()
+        ledger = PortfolioLedger(cash=CashLedger(balance=self.initial_capital))
+        cash = ledger.cash
+        positions = ledger.positions
+        trades = ledger.trades
         event_log: list[dict[str, Any]] = []
         time_rows: list[dict[str, Any]] = []
         reconciliation_rows: list[dict[str, object]] = []
@@ -96,6 +101,7 @@ class EventDrivenPortfolioBacktester:
             event_log.append(event_to_dict(SignalEvent(timestamp=signal_date, target_weights=weights)))
             starting_equity = cash.balance + positions.market_value
             entry_notional = 0.0
+            exit_notional = 0.0
             entry_cost = 0.0
             exit_cost = 0.0
             commission_cost = 0.0
@@ -147,6 +153,7 @@ class EventDrivenPortfolioBacktester:
                 event_log.append(event_to_dict(FillEvent(execution_date, symbol, quantity, close_price, costs.commission, costs.slippage_cost, "session_exit")))
                 event_log.append(event_to_dict(PositionEvent(execution_date, symbol, position.units, position.market_value)))
                 exit_cost += costs.total_cost
+                exit_notional += abs(signed_notional)
                 commission_cost += costs.commission
                 execution_cost += costs.spread_cost + costs.slippage_cost + costs.impact_cost
 
@@ -165,16 +172,11 @@ class EventDrivenPortfolioBacktester:
                     "difference": difference,
                 }
             )
-            turnover_rows.append(
-                {
-                    "date": execution_date,
-                    "signal_date": signal_date,
-                    "convention": "flat_intraday_entry_plus_exit",
-                    "entry_turnover": 0.0 if starting_equity == 0.0 else entry_notional / starting_equity,
-                    "exit_turnover": 0.0 if starting_equity == 0.0 else entry_notional / starting_equity,
-                    "turnover": 0.0 if starting_equity == 0.0 else 2.0 * entry_notional / starting_equity,
-                }
-            )
+            turnover_rows.append({
+                "date": execution_date,
+                "signal_date": signal_date,
+                **self.turnover_convention.report(starting_equity, entry_notional, exit_notional),
+            })
             time_rows.append(
                 {
                     "date": execution_date,
@@ -204,10 +206,12 @@ class EventDrivenPortfolioBacktester:
             turnover=pd.DataFrame(turnover_rows),
             constraints=pd.DataFrame(constraint_rows),
             events=event_log,
+            ledger=ledger,
         )
 
     def _empty_result(self) -> EventDrivenBacktestResult:
         return EventDrivenBacktestResult(
             timeseries=pd.DataFrame(), trades=pd.DataFrame(), reconciliation=pd.DataFrame(),
             turnover=pd.DataFrame(), constraints=pd.DataFrame(), events=[],
+            ledger=PortfolioLedger(cash=CashLedger(balance=self.initial_capital)),
         )

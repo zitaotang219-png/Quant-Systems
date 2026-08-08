@@ -8,6 +8,7 @@ import pandas as pd
 
 from backtest.engine import BacktestEngine
 from backtest.event_driven import EventDrivenPortfolioBacktester
+from backtest.ledger import PortfolioLedger
 from backtest.portfolio_constraints import PortfolioConstraints
 from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
 from execution.cost_model import TransactionCostModel
@@ -36,6 +37,7 @@ class PortfolioBacktestResult:
     constraint_report: pd.DataFrame | None = None
     events: list[dict[str, Any]] | None = None
     trading_convention: dict[str, Any] | None = None
+    ledger: PortfolioLedger | None = None
 
 
 @dataclass
@@ -95,7 +97,7 @@ class AlphaMiningStrategy:
 
         prepared = _prepare_panel(
             panel,
-            future_return_horizon=self.evaluator.future_return_horizon,
+            trading_convention=self.evaluator.trading_convention,
         )
         factor_columns = _evaluate_factor_columns(prepared, self.selected_factors)
         regime_by_date = _regime_series_for_panel(
@@ -149,6 +151,7 @@ class AlphaMiningStrategy:
             constraint_report=accounting.constraints,
             events=accounting.events,
             trading_convention=DEFAULT_TRADING_CONVENTION.to_dict(),
+            ledger=accounting.ledger,
         )
 
     def target_weights(self, panel: pd.DataFrame) -> dict[str, float]:
@@ -157,7 +160,7 @@ class AlphaMiningStrategy:
             return {}
         prepared = _prepare_panel(
             panel,
-            future_return_horizon=self.evaluator.future_return_horizon,
+            trading_convention=self.evaluator.trading_convention,
         )
         factor_columns = _evaluate_factor_columns(prepared, self.selected_factors)
         regime_by_date = _regime_series_for_panel(prepared, self.regime_config)
@@ -768,7 +771,7 @@ def _factor_evaluator_kwargs(config: AlphaMiningConfig) -> dict[str, Any]:
         "slippage_bps": config.evaluation.slippage_bps,
         "long_quantile": config.evaluation.long_quantile,
         "short_quantile": config.evaluation.short_quantile,
-        "future_return_horizon": config.evaluation.future_return_horizon,
+        "trading_convention": DEFAULT_TRADING_CONVENTION,
         "min_finite_ratio": config.evaluation.min_finite_ratio,
         "min_std": config.evaluation.min_std,
         "min_abs_rank_ic": config.evaluation.min_abs_rank_ic,
@@ -836,7 +839,6 @@ def _build_relaxed_pool_config(config: AlphaMiningConfig) -> AlphaMiningConfig:
         slippage_bps=config.evaluation.slippage_bps,
         long_quantile=config.evaluation.long_quantile,
         short_quantile=config.evaluation.short_quantile,
-        future_return_horizon=config.evaluation.future_return_horizon,
         min_finite_ratio=min(config.evaluation.min_finite_ratio, 0.45),
         min_std=config.evaluation.min_std,
         min_abs_rank_ic=min(config.evaluation.min_abs_rank_ic, 0.001),

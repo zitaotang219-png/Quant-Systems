@@ -34,7 +34,6 @@ class EvaluationConfig:
     slippage_bps: float = 5.0
     long_quantile: float = 0.2
     short_quantile: float = 0.2
-    future_return_horizon: int = 1
     min_finite_ratio: float = 0.6
     min_std: float = 1e-6
     min_abs_rank_ic: float = 0.005

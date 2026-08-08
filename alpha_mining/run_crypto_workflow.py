@@ -550,7 +550,6 @@ def build_crypto_workflow_config(
         slippage_bps=8.0,
         long_quantile=0.3,
         short_quantile=0.3,
-        future_return_horizon=1,
         min_finite_ratio=0.6,
         min_std=1e-6,
         min_abs_rank_ic=0.0025,

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
+from backtest.trading_convention import DEFAULT_TRADING_CONVENTION, TradingConvention
 
 from .config import FitnessConfig
 from .dsl import FactorNode
@@ -57,7 +57,7 @@ class FactorEvaluator:
     slippage_bps: float = 0.0
     long_quantile: float = 0.2
     short_quantile: float = 0.2
-    future_return_horizon: int = 1
+    trading_convention: TradingConvention = DEFAULT_TRADING_CONVENTION
     min_finite_ratio: float = MIN_FINITE_RATIO
     min_std: float = MIN_STD
     min_abs_rank_ic: float = 0.005
@@ -93,7 +93,7 @@ class FactorEvaluator:
     def _evaluate(self, node: FactorNode, panel: pd.DataFrame, deep: bool) -> EvaluationResult:
         prepared = _prepare_panel(
             panel,
-            future_return_horizon=self.future_return_horizon,
+            trading_convention=self.trading_convention,
         )
         key = f"{_panel_fingerprint(prepared)}|{node.describe()}|deep={int(deep)}"
         cached = self.cache.get(key)
@@ -161,7 +161,7 @@ class FactorEvaluator:
     ) -> EvaluationResult:
         prepared = _prepare_panel(
             panel,
-            future_return_horizon=self.future_return_horizon,
+            trading_convention=self.trading_convention,
         )
         raw_values = node.evaluate(prepared).astype(float)
         finite_ratio = float(np.isfinite(raw_values.to_numpy(dtype=float, na_value=np.nan)).mean())
@@ -356,7 +356,10 @@ class FactorEvaluator:
         return daily
 
 
-def _prepare_panel(panel: pd.DataFrame, future_return_horizon: int) -> pd.DataFrame:
+def _prepare_panel(
+    panel: pd.DataFrame,
+    trading_convention: TradingConvention = DEFAULT_TRADING_CONVENTION,
+) -> pd.DataFrame:
     required = ["date", "symbol", "open", "high", "low", "close", "volume"]
     missing = [column for column in required if column not in panel.columns]
     if missing:
@@ -367,10 +370,7 @@ def _prepare_panel(panel: pd.DataFrame, future_return_horizon: int) -> pd.DataFr
     prepared = prepared.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
     for column in ["open", "high", "low", "close", "volume"]:
         prepared[column] = pd.to_numeric(prepared[column], errors="coerce")
-    prepared["future_return"] = DEFAULT_TRADING_CONVENTION.forward_return(
-        prepared,
-        holding_bars=future_return_horizon,
-    )
+    prepared["future_return"] = trading_convention.forward_return(prepared)
     return prepared
 
 

@@ -24,13 +24,11 @@ class TradingConvention:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def forward_return(self, panel: pd.DataFrame, holding_bars: int = 1) -> pd.Series:
+    def forward_return(self, panel: pd.DataFrame) -> pd.Series:
         """Return implied by this convention: next open through the session close."""
 
-        if holding_bars < 1:
-            raise ValueError("holding_bars must be at least one.")
         next_open = panel.groupby("symbol", sort=False)["open"].shift(-1)
-        exit_close = panel.groupby("symbol", sort=False)["close"].shift(-holding_bars)
+        exit_close = panel.groupby("symbol", sort=False)["close"].shift(-1)
         return (exit_close / next_open) - 1.0
 
 

@@ -469,7 +469,13 @@ def construct_day_weights(
     aligned_score = score.astype(float).replace([np.inf, -np.inf], np.nan)
     aligned_vol = volatility.astype(float).replace([np.inf, -np.inf], np.nan)
     if weighting_scheme == "bucket":
-        target = _bucket_weights(aligned_score, long_quantile, short_quantile)
+        target = _bucket_weights(
+            aligned_score,
+            long_quantile,
+            short_quantile,
+            position_limit=position_limit,
+            gross_leverage=gross_leverage,
+        )
     else:
         ranked = aligned_score.rank(method="average", pct=True) - 0.5
         safe_vol = aligned_vol.where(aligned_vol.abs() > 1e-8, np.nan)
@@ -538,7 +544,14 @@ def _rolling_volatility(returns: pd.Series, dates: pd.Series, symbols: pd.Series
     return volatility.reindex(returns.index).astype(float)
 
 
-def _bucket_weights(score: pd.Series, long_quantile: float, short_quantile: float) -> pd.Series:
+def _bucket_weights(
+    score: pd.Series,
+    long_quantile: float,
+    short_quantile: float,
+    *,
+    position_limit: float,
+    gross_leverage: float,
+) -> pd.Series:
     clean = score.replace([np.inf, -np.inf], np.nan)
     ranked = clean.rank(method="average", pct=True)
     long_mask = ranked >= (1.0 - long_quantile)
@@ -550,7 +563,11 @@ def _bucket_weights(score: pd.Series, long_quantile: float, short_quantile: floa
         weights.loc[long_mask] = 1.0 / long_count
     if short_count > 0:
         weights.loc[short_mask] = -1.0 / short_count
-    return _weights_from_signal(weights, position_limit=1.0, gross_leverage=2.0)
+    return _weights_from_signal(
+        weights,
+        position_limit=position_limit,
+        gross_leverage=gross_leverage,
+    )
 
 
 def _weights_from_signal(signal: pd.Series, position_limit: float, gross_leverage: float) -> pd.Series:
