@@ -32,11 +32,15 @@ from data_crypto.loader import (
     load_crypto_benchmark_csv,
     load_crypto_panel_csv,
     load_crypto_universe_csv,
+    prepare_point_in_time_crypto_panel,
 )
+from data_crypto.data_quality import write_data_quality_report
+from data_crypto.market_cap import build_lagged_market_cap_weights
 from features_crypto.engineer import build_crypto_panel_features, engineered_crypto_feature_columns
 from utils.experiment_manifest import ExperimentManifest, create_experiment_directory
 from utils.io import ensure_dir, write_json
 from utils.random_state import set_global_seed
+from universes.point_in_time import build_universe_report
 
 
 DEFAULT_OUTPUT_DIR = Path("reports") / "crypto_alpha_workflow"
@@ -121,6 +125,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panel-dir", default=None, help="Directory with one CSV per crypto symbol.")
     parser.add_argument("--universe-csv", default=None, help="Optional crypto universe CSV with columns symbol,name.")
     parser.add_argument("--universe-preset", default="crypto30", choices=sorted(CRYPTO_UNIVERSE_PRESETS.keys()), help="Named crypto universe preset.")
+    parser.add_argument("--asset-master-csv", default="crypto_data/asset_master.csv", help="Asset lifecycle CSV used for point-in-time eligibility.")
+    parser.add_argument("--minimum-historical-bars", type=int, default=20, help="Bars required before an asset becomes eligible.")
+    parser.add_argument("--liquidity-threshold", type=float, default=0.0, help="Minimum median trailing dollar volume for eligibility.")
+    parser.add_argument("--minimum-data-completeness", type=float, default=1.0, help="Required completeness ratio across trailing history.")
     parser.add_argument("--btc-benchmark-csv", default=None, help="Optional BTC benchmark CSV. Defaults to panel-derived BTC benchmark when available.")
     parser.add_argument("--market-cap-benchmark-csv", default=None, help="Optional market-cap-weighted benchmark CSV.")
     parser.add_argument("--benchmark-name", default="BTC", help="Readable BTC benchmark name.")
@@ -181,6 +189,15 @@ def main() -> None:
         f"{len(pd.to_datetime(panel['date'], utc=False).dropna().unique())} trading dates"
     )
     panel.to_csv(output_dir / "panel.csv", index=False)
+    point_in_time_universe = pd.DataFrame(panel.attrs.get("point_in_time_universe_records", []))
+    asset_master = pd.DataFrame(panel.attrs.get("asset_master_records", []))
+    data_quality_report = panel.attrs.get("data_quality_report", {})
+    liquidity_sensitivity = pd.DataFrame(panel.attrs.get("liquidity_sensitivity_records", []))
+    if not point_in_time_universe.empty:
+        point_in_time_universe.to_csv(output_dir / "point_in_time_universe.csv", index=False)
+        write_text(output_dir / "universe_report.md", build_universe_report(point_in_time_universe, asset_master, panel))
+    write_data_quality_report(data_quality_report, output_dir / "data_quality_report.json")
+    liquidity_sensitivity.to_csv(output_dir / "liquidity_sensitivity.csv", index=False)
     btc_benchmark_df.to_csv(output_dir / "btc_benchmark.csv", index=False)
     equal_weight_benchmark_df.to_csv(output_dir / "equal_weight_benchmark.csv", index=False)
     market_cap_benchmark_df.to_csv(output_dir / "market_cap_benchmark.csv", index=False)
@@ -398,8 +415,20 @@ def load_or_build_crypto_panel(args: argparse.Namespace) -> pd.DataFrame:
     panel = panel.loc[panel["symbol"].astype(str).isin(universe)].copy()
     if panel.empty:
         raise ValueError("No rows remain after applying the crypto universe filter.")
-    panel = build_crypto_panel_features(panel)
-    return panel.reset_index(drop=True)
+    point_in_time = prepare_point_in_time_crypto_panel(
+        panel,
+        asset_master_path=getattr(args, "asset_master_csv", "crypto_data/asset_master.csv"),
+        minimum_historical_bars=max(int(getattr(args, "minimum_historical_bars", 20)), 1),
+        liquidity_threshold=max(float(getattr(args, "liquidity_threshold", 0.0)), 0.0),
+        minimum_data_completeness=min(max(float(getattr(args, "minimum_data_completeness", 1.0)), 0.0), 1.0),
+    )
+    featured = build_crypto_panel_features(point_in_time.panel).reset_index(drop=True)
+    # attrs must remain equality-safe because pandas compares them during concat.
+    featured.attrs["point_in_time_universe_records"] = point_in_time.universe.to_dict(orient="records")
+    featured.attrs["asset_master_records"] = point_in_time.asset_master.to_dict(orient="records")
+    featured.attrs["data_quality_report"] = point_in_time.data_quality.report
+    featured.attrs["liquidity_sensitivity_records"] = point_in_time.liquidity_sensitivity.to_dict(orient="records")
+    return featured
 
 
 def workflow_input_paths(args: argparse.Namespace) -> list[str]:
@@ -409,6 +438,7 @@ def workflow_input_paths(args: argparse.Namespace) -> list[str]:
             args.panel_csv,
             args.panel_dir,
             args.universe_csv,
+            args.asset_master_csv,
             args.btc_benchmark_csv,
             args.market_cap_benchmark_csv,
             args.fitness_config,
@@ -491,6 +521,17 @@ def build_market_cap_benchmark(
     universe: list[dict[str, str]],
     benchmark_name: str,
 ) -> pd.DataFrame:
+    lagged_weights = build_lagged_market_cap_weights(panel)
+    if not lagged_weights.empty and float(lagged_weights["weight"].sum()) > 0.0:
+        merged = panel[["date", "symbol", "open", "close"]].merge(lagged_weights, on=["date", "symbol"], how="left")
+        merged["intraday_return"] = (merged["close"] / merged["open"]) - 1.0
+        weighted = merged.groupby("date", sort=False).apply(
+            lambda day: float((day["intraday_return"].fillna(0.0) * day["weight"].fillna(0.0)).sum())
+        )
+        close = 100.0 * (1.0 + weighted).cumprod()
+        return pd.DataFrame({"date": weighted.index, "return": weighted.to_numpy(dtype=float), "close": close.to_numpy(dtype=float), "name": benchmark_name})
+
+    static_name = "static_reference_weight_benchmark"
     weight_map: dict[str, float] = {}
     for record in universe:
         symbol = str(record["symbol"]).upper()
@@ -499,23 +540,25 @@ def build_market_cap_benchmark(
             continue
         weight_map[symbol] = float(weight)
     if not weight_map:
-        return build_equal_weight_benchmark(panel, benchmark_name=benchmark_name)
+        return build_equal_weight_benchmark(panel, benchmark_name=static_name)
 
     weight_total = sum(max(weight, 0.0) for weight in weight_map.values())
     if weight_total <= 0.0:
-        return build_equal_weight_benchmark(panel, benchmark_name=benchmark_name)
+        return build_equal_weight_benchmark(panel, benchmark_name=static_name)
     normalized = {symbol: max(weight, 0.0) / weight_total for symbol, weight in weight_map.items()}
 
     ordered = panel.copy()
     ordered["date"] = pd.to_datetime(ordered["date"], utc=False)
     ordered = ordered.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True)
     ordered["future_weight"] = ordered["symbol"].astype(str).str.upper().map(normalized).fillna(0.0)
+    available_weight = ordered.groupby("date", sort=False)["future_weight"].transform("sum")
+    ordered["future_weight"] = (ordered["future_weight"] / available_weight).fillna(0.0)
     ordered["intraday_return"] = (ordered["close"] / ordered["open"]) - 1.0
     weighted = ordered.groupby("date", sort=False).apply(
         lambda day: float((day["intraday_return"].fillna(0.0) * day["future_weight"]).sum())
     )
     close = 100.0 * (1.0 + weighted).cumprod()
-    return pd.DataFrame({"date": weighted.index, "return": weighted.to_numpy(dtype=float), "close": close.to_numpy(dtype=float), "name": benchmark_name})
+    return pd.DataFrame({"date": weighted.index, "return": weighted.to_numpy(dtype=float), "close": close.to_numpy(dtype=float), "name": static_name})
 
 
 def build_crypto_workflow_config(

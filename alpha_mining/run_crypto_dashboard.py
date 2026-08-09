@@ -28,7 +28,7 @@ from alpha_mining.run_crypto_workflow import (
     to_jsonable,
     write_json,
 )
-from data_crypto.loader import load_crypto_panel_csv, load_crypto_universe_csv, load_crypto_benchmark_csv
+from data_crypto.loader import load_crypto_panel_csv, load_crypto_universe_csv, load_crypto_benchmark_csv, prepare_point_in_time_crypto_panel
 from execution_crypto.paper import run_crypto_paper_trading_with_factors
 from features_crypto.engineer import build_crypto_panel_features
 
@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--universe-csv", default=str(DEFAULT_UNIVERSE_CSV), help="Crypto universe CSV.")
     parser.add_argument("--btc-benchmark-csv", default=str(DEFAULT_BTC_BENCHMARK_CSV), help="BTC benchmark CSV.")
     parser.add_argument("--market-cap-benchmark-csv", default=str(DEFAULT_MARKET_CAP_BENCHMARK_CSV), help="Market-cap benchmark CSV.")
+    parser.add_argument("--asset-master-csv", default="crypto_data/asset_master.csv", help="Asset lifecycle CSV for point-in-time research inputs.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for dashboard run artifacts.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the dashboard server.")
     parser.add_argument("--port", type=int, default=5055, help="Port for the dashboard server.")
@@ -59,13 +60,11 @@ def create_app(args: argparse.Namespace) -> Flask:
     app = Flask(__name__, static_folder=str(ui_dir), static_url_path="")
 
     panel_raw = load_crypto_panel_csv(args.panel_csv)
-    panel = build_crypto_panel_features(panel_raw)
+    point_in_time = prepare_point_in_time_crypto_panel(panel_raw, asset_master_path=args.asset_master_csv, minimum_historical_bars=20)
+    panel = build_crypto_panel_features(point_in_time.panel)
     universe = load_crypto_universe_csv(args.universe_csv)
     btc_benchmark = load_crypto_benchmark_csv(args.btc_benchmark_csv, benchmark_name="BTC")
-    market_cap_benchmark = load_crypto_benchmark_csv(
-        args.market_cap_benchmark_csv,
-        benchmark_name="crypto_market_cap_weighted",
-    )
+    market_cap_benchmark = build_market_cap_benchmark(panel, universe, benchmark_name="crypto_market_cap_weighted")
     equal_weight_benchmark = build_equal_weight_benchmark(panel, benchmark_name="crypto_equal_weight")
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)

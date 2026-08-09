@@ -1,12 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
 
+from data_crypto.data_quality import DataQualityResult, validate_crypto_panel
+from data_crypto.liquidity_sensitivity import build_liquidity_sensitivity
+from universes.point_in_time import PointInTimeUniverseBuilder, filter_panel_to_point_in_time_universe, load_asset_master
+
 
 REQUIRED_OHLCV_COLUMNS = ("date", "symbol", "open", "high", "low", "close", "volume")
+
+
+@dataclass
+class PointInTimePanelResult:
+    panel: pd.DataFrame
+    universe: pd.DataFrame
+    asset_master: pd.DataFrame
+    data_quality: DataQualityResult
+    liquidity_sensitivity: pd.DataFrame
 
 
 def load_crypto_panel_csv(path: str | Path) -> pd.DataFrame:
@@ -92,6 +106,41 @@ def build_crypto_panel_from_directory(
         raise ValueError(f"No crypto CSV files matched under {input_path}.")
     panel = pd.concat(frames, ignore_index=True)
     return _normalize_crypto_panel(panel, source=input_path)
+
+
+def prepare_point_in_time_crypto_panel(
+    panel: pd.DataFrame,
+    *,
+    asset_master_path: str | Path,
+    minimum_historical_bars: int = 1,
+    liquidity_threshold: float = 0.0,
+    minimum_data_completeness: float = 1.0,
+) -> PointInTimePanelResult:
+    master = load_asset_master(asset_master_path)
+    quality = validate_crypto_panel(panel, asset_master=master)
+    builder = PointInTimeUniverseBuilder(
+        asset_master=master,
+        panel=quality.clean_panel,
+        minimum_historical_bars=minimum_historical_bars,
+        liquidity_threshold=liquidity_threshold,
+        minimum_data_completeness=minimum_data_completeness,
+    )
+    universe = builder.build_over_time()
+    filtered = filter_panel_to_point_in_time_universe(quality.clean_panel, universe)
+    if filtered.empty:
+        raise ValueError("Point-in-time universe filtering removed every panel row.")
+    return PointInTimePanelResult(
+        panel=filtered,
+        universe=universe,
+        asset_master=master,
+        data_quality=quality,
+        liquidity_sensitivity=build_liquidity_sensitivity(
+            quality.clean_panel,
+            master,
+            minimum_historical_bars=minimum_historical_bars,
+            minimum_data_completeness=minimum_data_completeness,
+        ),
+    )
 
 
 def _normalize_crypto_panel(panel: pd.DataFrame, source: Path) -> pd.DataFrame:

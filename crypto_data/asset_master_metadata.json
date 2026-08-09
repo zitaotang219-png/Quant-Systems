@@ -1,0 +1,7 @@
+{
+  "source": "Binance exchange instrument metadata plus manually curated lifecycle table",
+  "retrieval_date": "2026-08-08",
+  "version": "v1",
+  "symbol_count": 30,
+  "description": "Lifecycle metadata for the defined Crypto30 candidate universe. Listing and delisting dates support point-in-time eligibility only; this is not a complete historical exchange listing database."
+}
