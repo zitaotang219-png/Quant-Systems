@@ -220,6 +220,7 @@ def build_candidate_factor_pool(
     deep_keep: int | None = None,
     scoring_panel: pd.DataFrame | None = None,
     scoring_split: str = "validation",
+    telemetry_callback: Any | None = None,
 ) -> list[SelectedFactor]:
     filtered_panel = _filter_universe(panel, config.universe_symbols)
     evaluator = _build_evaluator(config)
@@ -247,6 +248,8 @@ def build_candidate_factor_pool(
         )
 
     population = generator.evolve(filtered_panel, pool_evaluator, deduplicate=config.deduplicate_expressions)
+    if telemetry_callback is not None:
+        telemetry_callback(generator)
     deep_results = _deep_evaluate_population(
         candidates=population,
         panel=scoring_target if scoring_target is not None else filtered_panel,

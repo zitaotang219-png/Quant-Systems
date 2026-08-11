@@ -310,6 +310,18 @@ def main() -> None:
         int(window.get("new_candidate_count", 0))
         for window in rolling_workflow["rolling_summary"].get("windows", [])
     )
+    gp_research_dir = ensure_dir(output_dir / "gp_research")
+    generation_statistics = rolling_workflow.get("gp_generation_statistics", pd.DataFrame())
+    candidate_audit = rolling_workflow.get("gp_candidate_audit", pd.DataFrame())
+    generation_statistics.to_csv(gp_research_dir / "generation_statistics.csv", index=False)
+    candidate_audit.to_csv(gp_research_dir / "candidate_audit.csv", index=False)
+    pd.DataFrame([{
+        "stage": "gp_evolution",
+        "raw_candidate_count": int(generation_statistics.get("raw_candidate_count", pd.Series(dtype=int)).sum()),
+        "unique_expression_count": int(generation_statistics.get("unique_expression_count", pd.Series(dtype=int)).sum()),
+        "accepted_candidate_count": int(generation_statistics.get("accepted_candidate_count", pd.Series(dtype=int)).sum()),
+        "selected_factor_count": int(rolling_workflow["rolling_summary"]["final_selected_factor_count"]),
+    }]).to_csv(gp_research_dir / "search_funnel.csv", index=False)
     search_statistics = {
         "candidate_generation_count": generated_factor_count,
         "evaluated_candidate_count": generated_factor_count,
@@ -914,6 +926,8 @@ def run_rolling_pool_workflow(
     rolling_dir = ensure_dir(output_dir / "rolling_pool")
     pool: list[SelectedFactor] = []
     window_rows: list[dict[str, Any]] = []
+    generation_rows: list[pd.DataFrame] = []
+    candidate_rows: list[pd.DataFrame] = []
 
     total_windows = len(ROLLING_WINDOW_SPECS)
     for window_index, spec in enumerate(ROLLING_WINDOW_SPECS, start=1):
@@ -927,6 +941,13 @@ def run_rolling_pool_workflow(
         train_panel = slice_panel_by_date(panel, spec["train_start"], spec["train_end"])
         validation_panel = slice_panel_by_date(panel, spec["validation_start"], spec["validation_end"])
         effective_train_panel = apply_purge_and_embargo(train_panel, validation_panel, purge_bars, embargo_bars)
+        def capture_telemetry(generator: Any, window_name: str = spec["name"]) -> None:
+            generation, candidates = generator.telemetry_frames()
+            generation["window"] = window_name
+            candidates["window"] = window_name
+            generation_rows.append(generation)
+            candidate_rows.append(candidates)
+
         new_pool = build_candidate_factor_pool(
             panel=effective_train_panel,
             config=window_config,
@@ -935,6 +956,7 @@ def run_rolling_pool_workflow(
             deep_keep=max(ROLLING_WINDOW_DEEP_KEEP, window_config.deep_eval_keep),
             scoring_panel=validation_panel,
             scoring_split="validation",
+            telemetry_callback=capture_telemetry,
         )
         combined_pool = dedupe_factor_pool([*pool, *new_pool])
         validated_pool = revalidate_factor_pool(combined_pool, validation_panel, window_config, fitness)
@@ -985,6 +1007,8 @@ def run_rolling_pool_workflow(
             "final_selected_factor_count": int(len(selected[: min(len(selected), 30)])),
             "windows": window_rows,
         },
+        "gp_generation_statistics": pd.concat(generation_rows, ignore_index=True) if generation_rows else pd.DataFrame(),
+        "gp_candidate_audit": pd.concat(candidate_rows, ignore_index=True) if candidate_rows else pd.DataFrame(),
     }
 
 

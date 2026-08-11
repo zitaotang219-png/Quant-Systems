@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -38,37 +38,66 @@ class GPGenerator:
     def __init__(self, config: GPConfig) -> None:
         self.config = config
         self.rng = np.random.default_rng(config.seed)
+        self.generation_statistics: list[dict[str, Any]] = []
+        self.candidate_audit: list[dict[str, Any]] = []
 
     def evolve(self, panel: pd.DataFrame, evaluator: FactorEvaluator, deduplicate: bool = True) -> list[GPCandidate]:
         population = [self.random_tree(max_depth=self.config.init_max_depth) for _ in range(self.config.population_size)]
         candidates = self._evaluate_population(population, panel, evaluator, deduplicate=deduplicate)
+        self._record_generation(0, population, candidates, [{"operator": "initial", "parents": []} for _ in population])
         thresholds = self._operator_thresholds()
 
-        for _ in range(self.config.generations):
+        for generation in range(1, self.config.generations + 1):
             next_population = [candidate.node for candidate in candidates[: self.config.elitism]]
+            provenance = [{"operator": "elite", "parents": [candidate.node.describe()]} for candidate in candidates[: self.config.elitism]]
+            operator_counts = {"crossover": 0, "subtree_mutation": 0, "point_mutation": 0, "reproduction": 0}
             while len(next_population) < self.config.population_size:
                 operator_choice = self.rng.random()
                 if operator_choice < thresholds["crossover"]:
                     parent_left = self.tournament_selection(candidates)
                     parent_right = self.tournament_selection(candidates)
                     child = self.subtree_crossover(parent_left.node, parent_right.node)
+                    operator, parents = "crossover", [parent_left.node.describe(), parent_right.node.describe()]
                 elif operator_choice < thresholds["subtree_mutation"]:
                     parent = self.tournament_selection(candidates)
                     child = self.subtree_mutation(parent.node)
+                    operator, parents = "subtree_mutation", [parent.node.describe()]
                 elif operator_choice < thresholds["point_mutation"]:
                     parent = self.tournament_selection(candidates)
                     child = self.point_mutation(parent.node)
+                    operator, parents = "point_mutation", [parent.node.describe()]
                 else:
                     parent = self.tournament_selection(candidates)
                     child = parent.node
+                    operator, parents = "reproduction", [parent.node.describe()]
                 next_population.append(child)
+                provenance.append({"operator": operator, "parents": parents})
+                operator_counts[operator] += 1
+            population = next_population[: self.config.population_size]
             candidates = self._evaluate_population(
-                next_population[: self.config.population_size],
+                population,
                 panel,
                 evaluator,
                 deduplicate=deduplicate,
             )
+            self._record_generation(generation, population, candidates, provenance, operator_counts)
         return candidates
+
+    def telemetry_frames(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        return pd.DataFrame(self.generation_statistics), pd.DataFrame(self.candidate_audit)
+
+    def _record_generation(self, generation: int, population: list[FactorNode], candidates: list[GPCandidate], provenance: list[dict[str, Any]], operator_counts: dict[str, int] | None = None) -> None:
+        by_expression = {candidate.node.describe(): candidate for candidate in candidates}
+        expressions = [node.describe() for node in population]
+        fitness = [candidate.evaluation.fitness for candidate in candidates]
+        complexity = [node.complexity() for node in population]
+        rejected = [candidate for candidate in candidates if candidate.evaluation.fitness <= VERY_BAD_FITNESS]
+        row = {"generation": generation, "population_size": len(population), "raw_candidate_count": len(population), "unique_expression_count": len(set(expressions)), "duplicate_count": len(population) - len(set(expressions)), "accepted_candidate_count": len(candidates) - len(rejected), "best_fitness": max(fitness) if fitness else float("nan"), "median_fitness": float(np.median(fitness)) if fitness else float("nan"), "mean_fitness": float(np.mean(fitness)) if fitness else float("nan"), "fitness_std": float(np.std(fitness)) if fitness else float("nan"), "best_complexity": min(complexity) if complexity else 0, "median_complexity": float(np.median(complexity)) if complexity else 0.0, "rejected_candidate_count": len(rejected), "rejection_reasons": ";".join(sorted({str(c.evaluation.metrics.get("rejection_reason", "unknown")) for c in rejected}))}
+        row.update({f"{name}_count": int((operator_counts or {}).get(name, 0)) for name in ("crossover", "subtree_mutation", "point_mutation", "reproduction")})
+        self.generation_statistics.append(row)
+        for node, metadata in zip(population, provenance):
+            expression = node.describe(); candidate = by_expression.get(expression)
+            self.candidate_audit.append({"expression": expression, "generation": generation, "creation_operator": metadata["operator"], "parent_expressions": " | ".join(metadata["parents"]), "complexity": node.complexity(), "depth": node.depth(), "fitness": candidate.evaluation.fitness if candidate else float("nan"), "rejection_reason": candidate.evaluation.metrics.get("rejection_reason", "") if candidate else "duplicate"})
 
     def random_tree(self, max_depth: int | None = None) -> FactorNode:
         depth_limit = max_depth if max_depth is not None else self.config.max_depth
