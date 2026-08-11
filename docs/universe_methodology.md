@@ -4,6 +4,8 @@
 
 The system uses a defined Crypto30 candidate universe. It is not a complete, exchange-wide historical universe and must not be interpreted as one. Candidate membership is stored in `crypto_data/binance_crypto30_daily/universe.csv`; lifecycle metadata is stored in `crypto_data/asset_master.csv` with provenance in `crypto_data/asset_master_metadata.json`.
 
+The fixed candidate universe is used to keep the local research dataset reproducible, bounded, and auditable. It is not equivalent to a full historical exchange universe because it does not enumerate every asset ever listed by an exchange. Lifecycle date sources and per-asset rationale are documented in `crypto_data/universe_sources/asset_lifecycle_sources.md`.
+
 ## Initial Universe Formation
 
 The research panel begins on 2023-01-01. An asset can first become eligible only after its lifecycle listing date and after it has accumulated the configured minimum historical bars. With the production default of 20 daily bars, the first eligible universe is formed on 2023-01-20 for assets available from the panel start.
@@ -22,5 +24,6 @@ The data-quality report distinguishes true missing bars from expected lifecycle 
 
 - The Crypto30 candidate list is manually defined and may omit historically listed assets outside that list.
 - Lifecycle metadata is manually curated from exchange metadata and requires periodic source refresh and independent verification.
+- The provenance ledger records the source category and retrieval date, but does not replace archived exchange listing or delisting notices.
 - The data uses a shared daily calendar; exchange outages and asset-specific trading suspensions require separate market-calendar metadata if they must be distinguished from true missing data.
 - A static reference-weight benchmark is used when historical point-in-time market-cap data is unavailable.

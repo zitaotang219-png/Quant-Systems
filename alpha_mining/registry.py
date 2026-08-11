@@ -17,7 +17,13 @@ class FactorRegistry:
     def __init__(self, base_dir: str | Path) -> None:
         self.base_dir = Path(base_dir)
 
-    def save(self, selected_factors: list[SelectedFactor], config: AlphaMiningConfig, panel: pd.DataFrame) -> None:
+    def save(
+        self,
+        selected_factors: list[SelectedFactor],
+        config: AlphaMiningConfig,
+        panel: pd.DataFrame,
+        search_statistics: dict[str, int | float] | None = None,
+    ) -> None:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         pkl_path = self.base_dir / config.registry.pkl_name
         csv_path = self.base_dir / config.registry.csv_name
@@ -55,6 +61,7 @@ class FactorRegistry:
             "code_fingerprint": _code_fingerprint(),
             "config": config.to_dict(),
             "factors": [factor.summary_row() for factor in selected_factors],
+            "search_statistics": dict(search_statistics or {}),
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
 

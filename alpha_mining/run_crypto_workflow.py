@@ -26,6 +26,7 @@ from alpha_mining import (
     select_factors_from_pool,
 )
 from alpha_mining.pipeline import _build_pool_evaluator, _single_split_map
+from alpha_research.factor_diagnostics import generate_factor_diagnostics
 from alpha_mining.regime import build_regime_frame, filter_regime_frame_by_dates, summarize_regime_frame
 from data_crypto.loader import (
     build_crypto_panel_from_directory,
@@ -41,6 +42,7 @@ from utils.experiment_manifest import ExperimentManifest, create_experiment_dire
 from utils.io import ensure_dir, write_json
 from utils.random_state import set_global_seed
 from universes.point_in_time import build_universe_report
+from universes.universe_audit import build_universe_audit
 
 
 DEFAULT_OUTPUT_DIR = Path("reports") / "crypto_alpha_workflow"
@@ -196,6 +198,7 @@ def main() -> None:
     if not point_in_time_universe.empty:
         point_in_time_universe.to_csv(output_dir / "point_in_time_universe.csv", index=False)
         write_text(output_dir / "universe_report.md", build_universe_report(point_in_time_universe, asset_master, panel))
+        write_text(output_dir / "universe_audit.md", build_universe_audit(asset_master, point_in_time_universe))
     write_data_quality_report(data_quality_report, output_dir / "data_quality_report.json")
     liquidity_sensitivity.to_csv(output_dir / "liquidity_sensitivity.csv", index=False)
     btc_benchmark_df.to_csv(output_dir / "btc_benchmark.csv", index=False)
@@ -303,8 +306,25 @@ def main() -> None:
         progress_callback=print_info,
     )
     print_terminal_progress(5, total_steps, "Validation Refinement Complete", f"Retained {len(selected)} factors")
-    FactorRegistry(config.registry_dir()).save(selected, config, research_panel)
+    generated_factor_count = sum(
+        int(window.get("new_candidate_count", 0))
+        for window in rolling_workflow["rolling_summary"].get("windows", [])
+    )
+    search_statistics = {
+        "candidate_generation_count": generated_factor_count,
+        "evaluated_candidate_count": generated_factor_count,
+        "rejected_candidate_count": max(generated_factor_count - len(selected), 0),
+        "selected_factor_count": len(selected),
+        "selection_ratio": float(len(selected) / generated_factor_count) if generated_factor_count else 0.0,
+    }
+    FactorRegistry(config.registry_dir()).save(selected, config, research_panel, search_statistics=search_statistics)
     write_selected_factors(output_dir, selected)
+    generate_factor_diagnostics(
+        factors=selected,
+        panel=research_panel,
+        output_dir=output_dir,
+        window_dir=output_dir / "rolling_pool",
+    )
     backtest_regime_source_panel = pd.concat(
         [research_panel, final_backtest_panel],
         ignore_index=True,
@@ -385,10 +405,6 @@ def main() -> None:
         ),
     )
 
-    generated_factor_count = sum(
-        int(window.get("new_candidate_count", 0))
-        for window in rolling_workflow["rolling_summary"].get("windows", [])
-    )
     manifest.set_research_results(
         generated_factor_count=generated_factor_count,
         selected_factors=[factor.expression for factor in selected],
