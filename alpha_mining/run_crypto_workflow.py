@@ -138,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory to write workflow outputs.")
     parser.add_argument("--fitness-config", default=None, help="Optional JSON file with FitnessConfig overrides.")
     parser.add_argument("--quick", action="store_true", help="Use lighter GP/pool settings for fast smoke runs.")
+    parser.add_argument("--research-only", action="store_true", help="Run rolling research and diagnostics without final-backtest execution.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible GP candidate generation.")
     return parser.parse_args()
 
@@ -315,12 +316,30 @@ def main() -> None:
     candidate_audit = rolling_workflow.get("gp_candidate_audit", pd.DataFrame())
     generation_statistics.to_csv(gp_research_dir / "generation_statistics.csv", index=False)
     candidate_audit.to_csv(gp_research_dir / "candidate_audit.csv", index=False)
+    audit_expressions = candidate_audit.get("expression", pd.Series(dtype=str))
+    audit_windows = candidate_audit.get("window", pd.Series(dtype=str))
     pd.DataFrame([{
-        "stage": "gp_evolution",
-        "raw_candidate_count": int(generation_statistics.get("raw_candidate_count", pd.Series(dtype=int)).sum()),
-        "unique_expression_count": int(generation_statistics.get("unique_expression_count", pd.Series(dtype=int)).sum()),
-        "accepted_candidate_count": int(generation_statistics.get("accepted_candidate_count", pd.Series(dtype=int)).sum()),
-        "selected_factor_count": int(rolling_workflow["rolling_summary"]["final_selected_factor_count"]),
+        "stage": "raw_gp_population",
+        "window": "all",
+        "input_count": int(generation_statistics.get("raw_individual_occurrences", pd.Series(dtype=int)).sum()),
+        "pass_count": int(generation_statistics.get("accepted_candidate_count", pd.Series(dtype=int)).sum()),
+        "reject_count": int(generation_statistics.get("rejected_candidate_count", pd.Series(dtype=int)).sum()),
+        "unique_expression_count": int(audit_expressions.nunique()),
+        "raw_individual_occurrences": int(generation_statistics.get("raw_individual_occurrences", pd.Series(dtype=int)).sum()),
+        "expression_evaluations": int(generation_statistics.get("expression_evaluations", pd.Series(dtype=int)).sum()),
+        "unique_expressions_global": int(audit_expressions.nunique()),
+        "unique_expression_window_pairs": int(pd.DataFrame({"window": audit_windows, "expression": audit_expressions}).drop_duplicates().shape[0]),
+    }, {
+        "stage": "post_refinement_selected_factors",
+        "window": "all",
+        "input_count": int(rolling_workflow["rolling_summary"]["final_selected_factor_count"]),
+        "pass_count": int(len(selected)),
+        "reject_count": int(rolling_workflow["rolling_summary"]["final_selected_factor_count"] - len(selected)),
+        "unique_expression_count": int(len({factor.expression for factor in selected})),
+        "raw_individual_occurrences": 0,
+        "expression_evaluations": 0,
+        "unique_expressions_global": 0,
+        "unique_expression_window_pairs": 0,
     }]).to_csv(gp_research_dir / "search_funnel.csv", index=False)
     search_statistics = {
         "candidate_generation_count": generated_factor_count,
@@ -337,6 +356,11 @@ def main() -> None:
         output_dir=output_dir,
         window_dir=output_dir / "rolling_pool",
     )
+    if args.research_only:
+        manifest.set_research_results(generated_factor_count=generated_factor_count, selected_factors=[factor.expression for factor in selected])
+        manifest.save(status="completed")
+        write_text(logs_dir / "workflow.log", "status=completed_research_only\n")
+        return
     backtest_regime_source_panel = pd.concat(
         [research_panel, final_backtest_panel],
         ignore_index=True,
@@ -945,6 +969,10 @@ def run_rolling_pool_workflow(
             generation, candidates = generator.telemetry_frames()
             generation["window"] = window_name
             candidates["window"] = window_name
+            candidates["individual_id"] = window_name + "-" + candidates["individual_id"].astype(str)
+            candidates["duplicate_of_id"] = candidates["duplicate_of_id"].where(
+                candidates["duplicate_of_id"].eq(""), window_name + "-" + candidates["duplicate_of_id"].astype(str)
+            )
             generation_rows.append(generation)
             candidate_rows.append(candidates)
 

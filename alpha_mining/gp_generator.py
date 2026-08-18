@@ -92,12 +92,19 @@ class GPGenerator:
         fitness = [candidate.evaluation.fitness for candidate in candidates]
         complexity = [node.complexity() for node in population]
         rejected = [candidate for candidate in candidates if candidate.evaluation.fitness <= VERY_BAD_FITNESS]
-        row = {"generation": generation, "population_size": len(population), "raw_candidate_count": len(population), "unique_expression_count": len(set(expressions)), "duplicate_count": len(population) - len(set(expressions)), "accepted_candidate_count": len(candidates) - len(rejected), "best_fitness": max(fitness) if fitness else float("nan"), "median_fitness": float(np.median(fitness)) if fitness else float("nan"), "mean_fitness": float(np.mean(fitness)) if fitness else float("nan"), "fitness_std": float(np.std(fitness)) if fitness else float("nan"), "best_complexity": min(complexity) if complexity else 0, "median_complexity": float(np.median(complexity)) if complexity else 0.0, "rejected_candidate_count": len(rejected), "rejection_reasons": ";".join(sorted({str(c.evaluation.metrics.get("rejection_reason", "unknown")) for c in rejected}))}
+        accepted = [candidate for candidate in candidates if candidate.evaluation.fitness > VERY_BAD_FITNESS]
+        accepted_fitness = [candidate.evaluation.fitness for candidate in accepted]
+        best = max(accepted, key=lambda candidate: candidate.evaluation.fitness) if accepted else None
+        row = {"generation": generation, "population_size": len(population), "raw_individual_occurrences": len(population), "expression_evaluations": len(candidates), "per_generation_unique_expressions": len(set(expressions)), "duplicate_count": len(population) - len(set(expressions)), "accepted_candidate_count": len(accepted), "best_fitness": best.evaluation.fitness if best else float("nan"), "accepted_mean_fitness": float(np.mean(accepted_fitness)) if accepted_fitness else float("nan"), "accepted_median_fitness": float(np.median(accepted_fitness)) if accepted_fitness else float("nan"), "accepted_fitness_std": float(np.std(accepted_fitness)) if accepted_fitness else float("nan"), "rejection_rate": float(len(rejected) / len(candidates)) if candidates else 0.0, "minimum_complexity": min(complexity) if complexity else 0, "median_complexity": float(np.median(complexity)) if complexity else 0.0, "best_fitness_candidate_complexity": best.node.complexity() if best else 0, "best_fitness_candidate_depth": best.node.depth() if best else 0, "rejected_candidate_count": len(rejected), "rejection_reasons": ";".join(sorted({str(c.evaluation.metrics.get("reject_reason", "unknown")) for c in rejected}))}
         row.update({f"{name}_count": int((operator_counts or {}).get(name, 0)) for name in ("crossover", "subtree_mutation", "point_mutation", "reproduction")})
         self.generation_statistics.append(row)
-        for node, metadata in zip(population, provenance):
+        first_seen: dict[str, int] = {}
+        for slot, (node, metadata) in enumerate(zip(population, provenance)):
             expression = node.describe(); candidate = by_expression.get(expression)
-            self.candidate_audit.append({"expression": expression, "generation": generation, "creation_operator": metadata["operator"], "parent_expressions": " | ".join(metadata["parents"]), "complexity": node.complexity(), "depth": node.depth(), "fitness": candidate.evaluation.fitness if candidate else float("nan"), "rejection_reason": candidate.evaluation.metrics.get("rejection_reason", "") if candidate else "duplicate"})
+            duplicate_of = first_seen.get(expression)
+            if duplicate_of is None:
+                first_seen[expression] = slot
+            self.candidate_audit.append({"individual_id": f"generation-{generation}-slot-{slot}", "generation": generation, "slot": slot, "expression": expression, "creation_operator": metadata["operator"], "parent_expressions": " | ".join(metadata["parents"]), "parent_individual_ids": "", "complexity": node.complexity(), "depth": node.depth(), "fitness": candidate.evaluation.fitness if candidate else float("nan"), "reject_reason": candidate.evaluation.metrics.get("reject_reason", "") if candidate else "duplicate", "is_exact_duplicate": duplicate_of is not None, "duplicate_of_id": f"generation-{generation}-slot-{duplicate_of}" if duplicate_of is not None else ""})
 
     def random_tree(self, max_depth: int | None = None) -> FactorNode:
         depth_limit = max_depth if max_depth is not None else self.config.max_depth
