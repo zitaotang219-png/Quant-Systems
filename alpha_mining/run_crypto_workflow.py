@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import sys
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -26,6 +28,8 @@ from alpha_mining import (
     select_factors_from_pool,
 )
 from alpha_mining.pipeline import _build_pool_evaluator, _single_split_map
+from alpha_mining.search_funnel import build_search_funnel
+from alpha_mining.search_funnel import build_hypothesis_statistics
 from alpha_research.factor_diagnostics import generate_factor_diagnostics
 from alpha_mining.regime import build_regime_frame, filter_regime_frame_by_dates, summarize_regime_frame
 from data_crypto.loader import (
@@ -39,10 +43,13 @@ from data_crypto.data_quality import write_data_quality_report
 from data_crypto.market_cap import build_lagged_market_cap_weights
 from features_crypto.engineer import build_crypto_panel_features, engineered_crypto_feature_columns
 from utils.experiment_manifest import ExperimentManifest, create_experiment_directory
+from utils.experiment_manifest import config_hash
+from utils.experiment_ledger import ExperimentLedger
 from utils.io import ensure_dir, write_json
 from utils.random_state import set_global_seed
 from universes.point_in_time import build_universe_report
 from universes.universe_audit import build_universe_audit
+from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
 
 
 DEFAULT_OUTPUT_DIR = Path("reports") / "crypto_alpha_workflow"
@@ -159,7 +166,55 @@ def print_info(message: str) -> None:
     print(f"[info] {message}")
 
 
-def main() -> None:
+def namespace_gp_telemetry(
+    generation: pd.DataFrame,
+    candidates: pd.DataFrame,
+    events: pd.DataFrame,
+    window_name: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Make generator-local IDs globally unambiguous without changing search data."""
+    prefix = f"{window_name}-"
+    scoped_generation = generation.copy()
+    scoped_candidates = candidates.copy()
+    scoped_events = events.copy()
+    scoped_generation["window"] = window_name
+    scoped_candidates["window"] = window_name
+    scoped_candidates["individual_id"] = prefix + scoped_candidates["individual_id"].astype(str)
+    scoped_candidates["duplicate_of_id"] = scoped_candidates["duplicate_of_id"].where(
+        scoped_candidates["duplicate_of_id"].eq(""),
+        prefix + scoped_candidates["duplicate_of_id"].astype(str),
+    )
+    scoped_candidates["parent_individual_ids"] = scoped_candidates["parent_individual_ids"].fillna("").map(
+        lambda value: " | ".join(prefix + parent for parent in str(value).split(" | ") if parent)
+    )
+    for column in ("parent_1_id", "parent_2_id"):
+        if column in scoped_candidates:
+            scoped_candidates[column] = scoped_candidates[column].fillna("").map(
+                lambda value: f"{prefix}{value}" if value else ""
+            )
+    scoped_events["window"] = window_name
+    scoped_events["individual_id"] = prefix + scoped_events["individual_id"].astype(str)
+    return scoped_generation, scoped_candidates, scoped_events
+
+
+def prepare_workflow_panels(panel: pd.DataFrame, *, research_only: bool) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Avoid materializing the spent holdout during research-only GP work."""
+    research_panel = slice_panel_by_date(
+        panel,
+        start=ROLLING_WINDOW_SPECS[0]["train_start"],
+        end=ROLLING_WINDOW_SPECS[-1]["validation_end"],
+    )
+    if research_panel.empty:
+        raise ValueError("Resolved rolling workflow windows produced an empty research panel.")
+    if research_only:
+        return research_panel, None
+    final_backtest_panel = slice_panel_by_date(panel, start=FINAL_BACKTEST_START, end=FINAL_BACKTEST_END)
+    if final_backtest_panel.empty:
+        raise ValueError("Resolved final backtest window produced an empty panel.")
+    return research_panel, final_backtest_panel
+
+
+def _main_workflow(lifecycle: dict[str, Any]) -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     warnings.filterwarnings("ignore", message="An input array is constant; the correlation coefficient is not defined.")
     args = parse_args()
@@ -238,19 +293,40 @@ def main() -> None:
     config_payload = to_jsonable(asdict(config))
     write_json(output_dir / "workflow_config.json", config_payload)
     manifest.set_config(portable_config_snapshot(config_payload))
+    ledger = ExperimentLedger(output_dir.parent)
+    ledger_configuration = {
+        "workflow": "crypto_alpha_rolling_pool",
+        "seed": args.seed,
+        "config": portable_config_snapshot(config_payload),
+        "dataset": build_dataset_metadata(panel),
+        "universe": universe,
+        "research_windows": ROLLING_WINDOW_SPECS,
+        "trading_convention": "signal_close_t_entry_open_t_plus_1_exit_close_t_plus_1",
+        "cli": " ".join(sys.argv),
+    }
+    started = ledger.start(
+        configuration=ledger_configuration,
+        metadata={
+            "run_directory": str(output_dir.resolve()),
+            "manifest": str(manifest.path.resolve()),
+            "git": manifest.payload["git"],
+            "entrypoint": "alpha_mining.run_crypto_workflow",
+        },
+    )
+    lifecycle.update({"ledger": ledger, "started": started, "manifest": manifest, "logs_dir": logs_dir})
+    manifest.payload["experiment_ledger"] = {
+        "experiment_id": started["experiment_id"],
+        "search_run_id": started["search_run_id"],
+        "configuration_fingerprint": started["configuration_fingerprint"],
+        "path": str(ledger.path.resolve()),
+    }
     manifest.save()
     print_terminal_progress(2, total_steps, "Preparing Splits And Config")
 
-    research_panel = slice_panel_by_date(
-        panel,
-        start=ROLLING_WINDOW_SPECS[0]["train_start"],
-        end=ROLLING_WINDOW_SPECS[-1]["validation_end"],
-    )
-    final_backtest_panel = slice_panel_by_date(panel, start=FINAL_BACKTEST_START, end=FINAL_BACKTEST_END)
-    if research_panel.empty or final_backtest_panel.empty:
-        raise ValueError("Resolved rolling workflow windows produced an empty research or final backtest panel.")
+    research_panel, final_backtest_panel = prepare_workflow_panels(panel, research_only=args.research_only)
     research_panel.to_csv(output_dir / "research_panel.csv", index=False)
-    final_backtest_panel.to_csv(output_dir / "backtest_panel.csv", index=False)
+    if final_backtest_panel is not None:
+        final_backtest_panel.to_csv(output_dir / "backtest_panel.csv", index=False)
     train_summary_panel = pd.concat(
         [slice_panel_by_date(research_panel, start=spec["train_start"], end=spec["train_end"]) for spec in ROLLING_WINDOW_SPECS],
         ignore_index=True,
@@ -260,7 +336,7 @@ def main() -> None:
         ignore_index=True,
     ).drop_duplicates(subset=["date", "symbol"]).reset_index(drop=True)
 
-    full_regime_frame = build_regime_frame(panel, config.regime)
+    full_regime_frame = build_regime_frame(research_panel if args.research_only else panel, config.regime)
     validation_regime_frame = filter_regime_frame_by_dates(
         full_regime_frame,
         pd.concat(
@@ -268,17 +344,27 @@ def main() -> None:
             ignore_index=True,
         ),
     )
-    backtest_regime_frame = filter_regime_frame_by_dates(full_regime_frame, final_backtest_panel["date"])
+    backtest_regime_frame = (
+        filter_regime_frame_by_dates(full_regime_frame, final_backtest_panel["date"])
+        if final_backtest_panel is not None
+        else pd.DataFrame()
+    )
     regime_dir = ensure_dir(output_dir / "regime")
     full_regime_frame.to_csv(regime_dir / "full_regime_history.csv", index=False)
     validation_regime_frame.to_csv(regime_dir / "validation_regime_history.csv", index=False)
-    backtest_regime_frame.to_csv(regime_dir / "backtest_regime_history.csv", index=False)
+    if final_backtest_panel is not None:
+        backtest_regime_frame.to_csv(regime_dir / "backtest_regime_history.csv", index=False)
     regime_summary = {
         "full": summarize_regime_frame(full_regime_frame),
         "validation": summarize_regime_frame(validation_regime_frame),
-        "backtest": summarize_regime_frame(backtest_regime_frame),
+        "backtest": summarize_regime_frame(backtest_regime_frame) if final_backtest_panel is not None else {},
     }
     write_json(regime_dir / "regime_summary.json", to_jsonable(regime_summary))
+    gp_research_dir = ensure_dir(output_dir / "gp_research")
+    write_json(
+        gp_research_dir / "baseline_protocol.json",
+        build_phase3a_baseline_protocol(args, config, research_panel, manifest, point_in_time_universe),
+    )
     print_terminal_progress(3, total_steps, "Building Regime Snapshots")
 
     rolling_workflow = run_rolling_pool_workflow(
@@ -311,42 +397,77 @@ def main() -> None:
         int(window.get("new_candidate_count", 0))
         for window in rolling_workflow["rolling_summary"].get("windows", [])
     )
-    gp_research_dir = ensure_dir(output_dir / "gp_research")
     generation_statistics = rolling_workflow.get("gp_generation_statistics", pd.DataFrame())
     candidate_audit = rolling_workflow.get("gp_candidate_audit", pd.DataFrame())
+    stage_events = rolling_workflow.get("gp_stage_events", pd.DataFrame())
     generation_statistics.to_csv(gp_research_dir / "generation_statistics.csv", index=False)
     candidate_audit.to_csv(gp_research_dir / "candidate_audit.csv", index=False)
-    audit_expressions = candidate_audit.get("expression", pd.Series(dtype=str))
-    audit_windows = candidate_audit.get("window", pd.Series(dtype=str))
-    pd.DataFrame([{
-        "stage": "raw_gp_population",
-        "window": "all",
-        "input_count": int(generation_statistics.get("raw_individual_occurrences", pd.Series(dtype=int)).sum()),
-        "pass_count": int(generation_statistics.get("accepted_candidate_count", pd.Series(dtype=int)).sum()),
-        "reject_count": int(generation_statistics.get("rejected_candidate_count", pd.Series(dtype=int)).sum()),
-        "unique_expression_count": int(audit_expressions.nunique()),
-        "raw_individual_occurrences": int(generation_statistics.get("raw_individual_occurrences", pd.Series(dtype=int)).sum()),
-        "expression_evaluations": int(generation_statistics.get("expression_evaluations", pd.Series(dtype=int)).sum()),
-        "unique_expressions_global": int(audit_expressions.nunique()),
-        "unique_expression_window_pairs": int(pd.DataFrame({"window": audit_windows, "expression": audit_expressions}).drop_duplicates().shape[0]),
-    }, {
-        "stage": "post_refinement_selected_factors",
-        "window": "all",
-        "input_count": int(rolling_workflow["rolling_summary"]["final_selected_factor_count"]),
-        "pass_count": int(len(selected)),
-        "reject_count": int(rolling_workflow["rolling_summary"]["final_selected_factor_count"] - len(selected)),
-        "unique_expression_count": int(len({factor.expression for factor in selected})),
-        "raw_individual_occurrences": 0,
-        "expression_evaluations": 0,
-        "unique_expressions_global": 0,
-        "unique_expression_window_pairs": 0,
-    }]).to_csv(gp_research_dir / "search_funnel.csv", index=False)
+    stage_events.to_csv(gp_research_dir / "stage_events.csv", index=False)
+    source_ids = (
+        candidate_audit.drop_duplicates("expression", keep="first").set_index("expression")["individual_id"].to_dict()
+        if not candidate_audit.empty
+        else {}
+    )
+    initial_selected = rolling_workflow["selected_factors"]
+    final_expressions = {factor.expression for factor in selected}
+    refinement_events = []
+    for factor in initial_selected:
+        expression = factor.expression
+        common = {
+            "window": "final",
+            "individual_id": source_ids.get(expression, ""),
+            "expression": expression,
+            "expression_hash": hashlib.sha256(expression.encode("utf-8")).hexdigest(),
+            "generation": None,
+            "slot": None,
+        }
+        refinement_events.append({
+            **common,
+            "stage": "validation_refinement",
+            "status": "passed" if expression in final_expressions else "rejected",
+            "reject_reason": "" if expression in final_expressions else "refinement_rejected",
+        })
+    for factor in selected:
+        expression = factor.expression
+        refinement_events.append({
+            "window": "final",
+            "individual_id": source_ids.get(expression, ""),
+            "expression": expression,
+            "expression_hash": hashlib.sha256(expression.encode("utf-8")).hexdigest(),
+            "generation": None,
+            "slot": None,
+            "stage": "final_research_selection",
+            "status": "passed",
+            "reject_reason": "",
+        })
+    stage_events = pd.concat([stage_events, pd.DataFrame(refinement_events)], ignore_index=True, sort=False)
+    final_pool_events = [
+        {
+            "window": "final",
+            "individual_id": source_ids.get(factor.expression, ""),
+            "expression": factor.expression,
+            "expression_hash": hashlib.sha256(factor.expression.encode("utf-8")).hexdigest(),
+            "generation": None,
+            "slot": None,
+            "stage": "final_candidate_pool",
+            "status": "passed",
+            "reject_reason": "",
+        }
+        for factor in rolling_workflow["candidate_pool"]
+    ]
+    stage_events = pd.concat([stage_events, pd.DataFrame(final_pool_events)], ignore_index=True, sort=False)
+    stage_events.to_csv(gp_research_dir / "stage_events.csv", index=False)
+    funnel = build_search_funnel(stage_events)
+    funnel.to_csv(gp_research_dir / "search_funnel.csv", index=False)
+    hypothesis_statistics = build_hypothesis_statistics(stage_events, len(selected))
+    write_json(gp_research_dir / "hypothesis_statistics.json", to_jsonable(hypothesis_statistics))
     search_statistics = {
-        "candidate_generation_count": generated_factor_count,
-        "evaluated_candidate_count": generated_factor_count,
-        "rejected_candidate_count": max(generated_factor_count - len(selected), 0),
+        "candidate_generation_count": int(hypothesis_statistics["raw_individual_occurrences"]),
+        "evaluated_candidate_count": int(hypothesis_statistics["expression_evaluation_calls"]),
+        "rejected_candidate_count": int((stage_events["status"] == "rejected").sum()),
         "selected_factor_count": len(selected),
         "selection_ratio": float(len(selected) / generated_factor_count) if generated_factor_count else 0.0,
+        **hypothesis_statistics,
     }
     FactorRegistry(config.registry_dir()).save(selected, config, research_panel, search_statistics=search_statistics)
     write_selected_factors(output_dir, selected)
@@ -357,8 +478,13 @@ def main() -> None:
         window_dir=output_dir / "rolling_pool",
     )
     if args.research_only:
+        write_text(
+            output_dir / "phase3a_report.md",
+            build_phase3a_report(generation_statistics, funnel, hypothesis_statistics, holdout_untouched=True),
+        )
         manifest.set_research_results(generated_factor_count=generated_factor_count, selected_factors=[factor.expression for factor in selected])
         manifest.save(status="completed")
+        ledger.complete(started, results={"selected_factors": [factor.expression for factor in selected], "artifacts": {"run_directory": str(output_dir.resolve()), "search_funnel": str((gp_research_dir / "search_funnel.csv").resolve())}})
         write_text(logs_dir / "workflow.log", "status=completed_research_only\n")
         return
     backtest_regime_source_panel = pd.concat(
@@ -446,6 +572,7 @@ def main() -> None:
         selected_factors=[factor.expression for factor in selected],
     )
     manifest.save(status="completed")
+    ledger.complete(started, results={"selected_factors": [factor.expression for factor in selected], "artifacts": {"run_directory": str(output_dir.resolve()), "workflow_report": str(workflow_report_path.resolve()), "search_funnel": str((gp_research_dir / "search_funnel.csv").resolve())}})
     write_text(logs_dir / "workflow.log", "status=completed\n")
 
     print("Crypto rolling-pool workflow complete.")
@@ -454,6 +581,25 @@ def main() -> None:
     print(f"Workflow report: {workflow_report_path.resolve()}")
     print(f"Backtest report: {backtest_report_path.resolve()}")
     print(f"Backtest metrics: {output_dir / 'backtest' / 'backtest_metrics.json'}")
+
+
+def main() -> None:
+    """Run the workflow while making normal exception-path failures durable."""
+    lifecycle: dict[str, Any] = {}
+    try:
+        _main_workflow(lifecycle)
+    except BaseException as error:
+        ledger = lifecycle.get("ledger")
+        started = lifecycle.get("started")
+        manifest = lifecycle.get("manifest")
+        if ledger is not None and started is not None:
+            ledger.fail(started, error)
+        if manifest is not None:
+            manifest.save(status="failed")
+        logs_dir = lifecycle.get("logs_dir")
+        if logs_dir is not None:
+            write_text(Path(logs_dir) / "workflow.log", f"status=failed\nerror={type(error).__name__}: {error}\n")
+        raise
 
 
 def load_or_build_crypto_panel(args: argparse.Namespace) -> pd.DataFrame:
@@ -519,6 +665,138 @@ def portable_config_snapshot(config_payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(registry, dict) and "directory" in registry:
         registry["directory"] = "alpha_mining_registry"
     return snapshot
+
+
+def build_phase3a_baseline_protocol(
+    args: argparse.Namespace,
+    config: AlphaMiningConfig,
+    research_panel: pd.DataFrame,
+    manifest: ExperimentManifest,
+    point_in_time_universe: pd.DataFrame,
+) -> dict[str, Any]:
+    data_hash = hashlib.sha256(
+        pd.util.hash_pandas_object(research_panel, index=True).values.tobytes()
+    ).hexdigest()
+    return {
+        "phase": "3A_vanilla_gp_baseline",
+        "data": {
+            "dataset_paths": [record["path"] for record in manifest.payload["data"]["inputs"]],
+            "dataset_fingerprints": manifest.payload["data"]["inputs"],
+            "research_data_hash": data_hash,
+            "research_start": ROLLING_WINDOW_SPECS[0]["train_start"],
+            "research_end": ROLLING_WINDOW_SPECS[-1]["validation_end"],
+            "pit_universe_configuration": {
+                "asset_master_csv": args.asset_master_csv,
+                "minimum_historical_bars": args.minimum_historical_bars,
+                "liquidity_threshold": args.liquidity_threshold,
+                "minimum_data_completeness": args.minimum_data_completeness,
+                "universe_record_count": int(len(point_in_time_universe)),
+            },
+        },
+        "validation_design": {
+            "rolling_windows": ROLLING_WINDOW_SPECS,
+            "purge_bars": ROLLING_POOL_PURGE_BARS,
+            "embargo_bars": ROLLING_POOL_EMBARGO_BARS,
+        },
+        "gp_configuration": to_jsonable(asdict(config.gp)),
+        "evaluation_configuration": {
+            "trading_convention": DEFAULT_TRADING_CONVENTION.to_dict(),
+            "evaluator_thresholds": to_jsonable(asdict(config.evaluation)),
+            "fitness_configuration": to_jsonable(asdict(config.fitness)),
+            "transaction_cost_assumptions": {
+                "transaction_cost_bps": config.evaluation.transaction_cost_bps,
+                "slippage_bps": config.evaluation.slippage_bps,
+            },
+        },
+        "reproducibility": {
+            "git": manifest.payload["git"],
+            "config_hash": manifest.payload["config_hash"],
+            "data_hash": data_hash,
+            "runtime": manifest.payload["runtime"],
+            "random_seed": config.gp.seed,
+        },
+        "holdout_policy": {
+            "final_holdout_status": "spent",
+            "final_holdout_period": f"{FINAL_BACKTEST_START}/{FINAL_BACKTEST_END}",
+            "statement": "The existing final backtest period has already been inspected and is considered a spent holdout. It must not be used to choose, tune, accept, or reject future GP-search modifications.",
+        },
+    }
+
+
+def build_phase3a_report(
+    generation_statistics: pd.DataFrame,
+    funnel: pd.DataFrame,
+    hypothesis_statistics: dict[str, Any],
+    *,
+    holdout_untouched: bool,
+) -> str:
+    raw = int(hypothesis_statistics["raw_individual_occurrences"])
+    unique = int(hypothesis_statistics["unique_expressions_global"])
+    duplicate_rate = 1.0 - (unique / raw) if raw else 0.0
+    rejection_rows = funnel.sort_values("reject_count", ascending=False) if not funnel.empty else pd.DataFrame()
+    largest_rejection = "n/a"
+    if not rejection_rows.empty:
+        row = rejection_rows.iloc[0]
+        largest_rejection = f"{row['window']} / {row['stage']}: {int(row['reject_count'])}"
+    operator_lines = []
+    for operator in ("crossover", "subtree_mutation", "point_mutation"):
+        attempted = int(generation_statistics.get(f"{operator}_attempted", pd.Series(dtype=int)).sum())
+        effective = int(generation_statistics.get(f"{operator}_effective", pd.Series(dtype=int)).sum())
+        rate = effective / attempted if attempted else 0.0
+        operator_lines.append(f"- {operator} effective rate: {effective}/{attempted} ({rate:.2%})")
+    diversity_lines = []
+    for window, subset in generation_statistics.groupby("window", sort=False):
+        ordered = subset.sort_values("generation")
+        first = float(ordered.iloc[0]["per_generation_unique_expressions"] / ordered.iloc[0]["population_size"])
+        last = float(ordered.iloc[-1]["per_generation_unique_expressions"] / ordered.iloc[-1]["population_size"])
+        diversity_lines.append(f"- {window}: generation-0 {first:.2%}; final generation {last:.2%}")
+    same_parent = int(generation_statistics.get("offspring_same_as_parent_count", pd.Series(dtype=int)).sum())
+    offspring_duplicates = int(generation_statistics.get("offspring_duplicate_in_generation_count", pd.Series(dtype=int)).sum())
+    novel_count = int(generation_statistics.get("novel_offspring_count", pd.Series(dtype=int)).sum())
+    total_offspring = int(
+        generation_statistics.get("elite_count", pd.Series(dtype=int)).sum()
+        + generation_statistics.get("crossover_attempted", pd.Series(dtype=int)).sum()
+        + generation_statistics.get("subtree_mutation_attempted", pd.Series(dtype=int)).sum()
+        + generation_statistics.get("point_mutation_attempted", pd.Series(dtype=int)).sum()
+        + generation_statistics.get("reproduction_count", pd.Series(dtype=int)).sum()
+    )
+    novel_rate = novel_count / total_offspring if total_offspring else 0.0
+    complexity_change = "n/a"
+    fitness_change = "n/a"
+    if not generation_statistics.empty:
+        ordered = generation_statistics.sort_values(["window", "generation"])
+        complexity_change = f"{float(ordered.iloc[0]['median_complexity']):.2f} to {float(ordered.iloc[-1]['median_complexity']):.2f}"
+        fitness_change = f"{float(ordered.iloc[0]['accepted_mean_fitness']):.4f} to {float(ordered.iloc[-1]['accepted_mean_fitness']):.4f}"
+    rejection_reason_rows = funnel.loc[funnel["rejection_reasons"].astype(str) != "", ["window", "stage", "rejection_reasons"]]
+    rejection_reason_text = "; ".join(
+        f"{row.window}/{row.stage}: {row.rejection_reasons}"
+        for row in rejection_reason_rows.itertuples(index=False)
+    ) or "n/a"
+    return "\n".join([
+        "# Phase 3A Vanilla GP Research Report",
+        "",
+        "## Search Accounting",
+        f"- Raw GP individuals: {raw}",
+        f"- Globally unique expressions: {unique}",
+        f"- Exact-duplication share of raw occurrences: {duplicate_rate:.2%}",
+        f"- Largest recorded rejection stage: {largest_rejection}",
+        f"- Recorded rejection reasons: {rejection_reason_text}",
+        "",
+        "## Diversity And Convergence",
+        *diversity_lines,
+        f"- Median complexity, first to final recorded generation: {complexity_change}",
+        f"- Accepted mean fitness, first to final recorded generation: {fitness_change}",
+        f"- Novel offspring: {novel_count}; duplicate offspring: {offspring_duplicates}; same-as-parent offspring: {same_parent}; derived novel rate: {novel_rate:.2%}",
+        "- Interpretation is observational: rapid diversity loss would motivate future diversity work, while poor validation survival would instead point to generalization quality.",
+        "",
+        "## Operator Effectiveness",
+        *operator_lines,
+        "",
+        "## Holdout Protection",
+        f"- Spent final holdout untouched: {'yes' if holdout_untouched else 'no'}",
+        "- Telemetry is observational and does not alter GP selection, operators, fitness, or portfolio logic.",
+        "",
+    ])
 
 
 def load_or_build_btc_benchmark(args: argparse.Namespace, panel: pd.DataFrame) -> pd.DataFrame:
@@ -822,6 +1100,7 @@ def revalidate_factor_pool(
     panel: pd.DataFrame,
     config: AlphaMiningConfig,
     fitness_config: FitnessConfig,
+    event_callback: Any | None = None,
 ) -> list[SelectedFactor]:
     if not candidate_pool or panel.empty:
         return []
@@ -831,7 +1110,11 @@ def revalidate_factor_pool(
     for factor in candidate_pool:
         evaluation = evaluator.evaluate_with_splits(factor.node, panel, split_map)
         if evaluation.fitness <= -1_000_000_000.0:
+            if event_callback is not None:
+                event_callback(factor, "rejected", str(evaluation.metrics.get("reject_reason", "very_bad_fitness")))
             continue
+        if event_callback is not None:
+            event_callback(factor, "passed", "")
         metrics = dict(evaluation.metrics)
         previous_passes = int(factor.metrics.get("window_pass_count", 0))
         if previous_passes > 0:
@@ -952,6 +1235,28 @@ def run_rolling_pool_workflow(
     window_rows: list[dict[str, Any]] = []
     generation_rows: list[pd.DataFrame] = []
     candidate_rows: list[pd.DataFrame] = []
+    stage_event_rows: list[pd.DataFrame] = []
+    source_individual_ids: dict[str, str] = {}
+
+    def stage_event(
+        factor: SelectedFactor,
+        stage: str,
+        status: str,
+        reject_reason: str = "",
+        window_name: str = "final",
+    ) -> dict[str, Any]:
+        expression = factor.expression
+        return {
+            "window": window_name,
+            "individual_id": source_individual_ids.get(expression, ""),
+            "expression": expression,
+            "expression_hash": hashlib.sha256(expression.encode("utf-8")).hexdigest(),
+            "generation": None,
+            "slot": None,
+            "stage": stage,
+            "status": status,
+            "reject_reason": reject_reason,
+        }
 
     total_windows = len(ROLLING_WINDOW_SPECS)
     for window_index, spec in enumerate(ROLLING_WINDOW_SPECS, start=1):
@@ -967,14 +1272,13 @@ def run_rolling_pool_workflow(
         effective_train_panel = apply_purge_and_embargo(train_panel, validation_panel, purge_bars, embargo_bars)
         def capture_telemetry(generator: Any, window_name: str = spec["name"]) -> None:
             generation, candidates = generator.telemetry_frames()
-            generation["window"] = window_name
-            candidates["window"] = window_name
-            candidates["individual_id"] = window_name + "-" + candidates["individual_id"].astype(str)
-            candidates["duplicate_of_id"] = candidates["duplicate_of_id"].where(
-                candidates["duplicate_of_id"].eq(""), window_name + "-" + candidates["duplicate_of_id"].astype(str)
-            )
+            events = generator.stage_events_frame()
+            generation, candidates, events = namespace_gp_telemetry(generation, candidates, events, window_name)
             generation_rows.append(generation)
             candidate_rows.append(candidates)
+            for row in candidates.itertuples(index=False):
+                source_individual_ids.setdefault(str(row.expression), str(row.individual_id))
+            stage_event_rows.append(events)
 
         new_pool = build_candidate_factor_pool(
             panel=effective_train_panel,
@@ -986,9 +1290,42 @@ def run_rolling_pool_workflow(
             scoring_split="validation",
             telemetry_callback=capture_telemetry,
         )
-        combined_pool = dedupe_factor_pool([*pool, *new_pool])
-        validated_pool = revalidate_factor_pool(combined_pool, validation_panel, window_config, fitness)
+        before_dedupe = [*pool, *new_pool]
+        combined_pool = dedupe_factor_pool(before_dedupe)
+        retained_after_dedupe = {id(factor) for factor in combined_pool}
+        stage_event_rows.append(pd.DataFrame([
+            stage_event(
+                factor,
+                "pool_deduplication",
+                "passed" if id(factor) in retained_after_dedupe else "rejected",
+                "" if id(factor) in retained_after_dedupe else "exact_duplicate",
+                spec["name"],
+            )
+            for factor in before_dedupe
+        ]))
+        validation_events: list[dict[str, Any]] = []
+        validated_pool = revalidate_factor_pool(
+            combined_pool,
+            validation_panel,
+            window_config,
+            fitness,
+            event_callback=lambda factor, status, reason: validation_events.append(
+                stage_event(factor, "rolling_revalidation", status, reason, spec["name"])
+            ),
+        )
+        stage_event_rows.append(pd.DataFrame(validation_events))
         pool = trim_candidate_pool(validated_pool, ROLLING_POOL_LIMIT)
+        retained_after_trim = {factor.expression for factor in pool}
+        stage_event_rows.append(pd.DataFrame([
+            stage_event(
+                factor,
+                "rolling_pool_trim",
+                "passed" if factor.expression in retained_after_trim else "rejected",
+                "" if factor.expression in retained_after_trim else "pool_trimmed",
+                spec["name"],
+            )
+            for factor in validated_pool
+        ]))
 
         window_dir = ensure_dir(rolling_dir / spec["name"])
         pd.DataFrame([factor.summary_row() for factor in new_pool]).to_csv(window_dir / "new_candidates.csv", index=False)
@@ -1014,6 +1351,16 @@ def run_rolling_pool_workflow(
     final_pool = rescore_candidate_pool(pool, final_fitness)
     final_pool = trim_candidate_pool(final_pool, ROLLING_POOL_LIMIT)
     selected = select_factors_from_pool(final_pool, clone_config_with_fitness(config, final_fitness), final_fitness)
+    selected_expressions = {factor.expression for factor in selected}
+    stage_event_rows.append(pd.DataFrame([
+        stage_event(
+            factor,
+            "initial_factor_selection",
+            "passed" if factor.expression in selected_expressions else "rejected",
+            "" if factor.expression in selected_expressions else "not_selected",
+        )
+        for factor in final_pool
+    ]))
     min_required = int(config.portfolio.min_selected_factor_count)
     if len(selected) < min_required:
         raise ValueError(
@@ -1037,6 +1384,7 @@ def run_rolling_pool_workflow(
         },
         "gp_generation_statistics": pd.concat(generation_rows, ignore_index=True) if generation_rows else pd.DataFrame(),
         "gp_candidate_audit": pd.concat(candidate_rows, ignore_index=True) if candidate_rows else pd.DataFrame(),
+        "gp_stage_events": pd.concat(stage_event_rows, ignore_index=True) if stage_event_rows else pd.DataFrame(),
     }
 
 

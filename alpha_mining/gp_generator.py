@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Any, Callable
 
 import numpy as np
@@ -32,6 +33,7 @@ from .evaluator import FactorEvaluator, EvaluationResult, VERY_BAD_FITNESS
 class GPCandidate:
     node: FactorNode
     evaluation: EvaluationResult
+    individual_id: str = ""
 
 
 class GPGenerator:
@@ -40,53 +42,82 @@ class GPGenerator:
         self.rng = np.random.default_rng(config.seed)
         self.generation_statistics: list[dict[str, Any]] = []
         self.candidate_audit: list[dict[str, Any]] = []
+        self.stage_events: list[dict[str, Any]] = []
 
     def evolve(self, panel: pd.DataFrame, evaluator: FactorEvaluator, deduplicate: bool = True) -> list[GPCandidate]:
         population = [self.random_tree(max_depth=self.config.init_max_depth) for _ in range(self.config.population_size)]
-        candidates = self._evaluate_population(population, panel, evaluator, deduplicate=deduplicate)
-        self._record_generation(0, population, candidates, [{"operator": "initial", "parents": []} for _ in population])
+        ids = [self._individual_id(0, slot) for slot in range(len(population))]
+        provenance = [{"operator": "initial", "parents": [], "parent_ids": []} for _ in population]
+        candidates = self._evaluate_population(population, ids, panel, evaluator, deduplicate=deduplicate)
+        self._record_generation(0, population, ids, candidates, provenance)
         thresholds = self._operator_thresholds()
 
         for generation in range(1, self.config.generations + 1):
             next_population = [candidate.node for candidate in candidates[: self.config.elitism]]
-            provenance = [{"operator": "elite", "parents": [candidate.node.describe()]} for candidate in candidates[: self.config.elitism]]
-            operator_counts = {"crossover": 0, "subtree_mutation": 0, "point_mutation": 0, "reproduction": 0}
+            next_ids = [self._individual_id(generation, slot) for slot in range(len(next_population))]
+            provenance = [{"operator": "elite", "parents": [candidate.node.describe()], "parent_ids": [candidate.individual_id]} for candidate in candidates[: self.config.elitism]]
+            operator_counts = {
+                "elite_count": len(next_population),
+                "crossover_attempted": 0, "crossover_effective": 0,
+                "subtree_mutation_attempted": 0, "subtree_mutation_effective": 0,
+                "point_mutation_attempted": 0, "point_mutation_effective": 0,
+                "reproduction_count": 0,
+                "offspring_same_as_parent_count": 0,
+            }
             while len(next_population) < self.config.population_size:
                 operator_choice = self.rng.random()
                 if operator_choice < thresholds["crossover"]:
                     parent_left = self.tournament_selection(candidates)
                     parent_right = self.tournament_selection(candidates)
                     child = self.subtree_crossover(parent_left.node, parent_right.node)
-                    operator, parents = "crossover", [parent_left.node.describe(), parent_right.node.describe()]
+                    operator, parents, parent_ids = "crossover", [parent_left.node.describe(), parent_right.node.describe()], [parent_left.individual_id, parent_right.individual_id]
                 elif operator_choice < thresholds["subtree_mutation"]:
                     parent = self.tournament_selection(candidates)
                     child = self.subtree_mutation(parent.node)
-                    operator, parents = "subtree_mutation", [parent.node.describe()]
+                    operator, parents, parent_ids = "subtree_mutation", [parent.node.describe()], [parent.individual_id]
                 elif operator_choice < thresholds["point_mutation"]:
                     parent = self.tournament_selection(candidates)
                     child = self.point_mutation(parent.node)
-                    operator, parents = "point_mutation", [parent.node.describe()]
+                    operator, parents, parent_ids = "point_mutation", [parent.node.describe()], [parent.individual_id]
                 else:
                     parent = self.tournament_selection(candidates)
                     child = parent.node
-                    operator, parents = "reproduction", [parent.node.describe()]
+                    operator, parents, parent_ids = "reproduction", [parent.node.describe()], [parent.individual_id]
                 next_population.append(child)
-                provenance.append({"operator": operator, "parents": parents})
-                operator_counts[operator] += 1
+                next_ids.append(self._individual_id(generation, len(next_ids)))
+                provenance.append({"operator": operator, "parents": parents, "parent_ids": parent_ids})
+                child_expression = child.describe()
+                same_as_parent = child_expression == parents[0]
+                if operator == "crossover":
+                    operator_counts["crossover_attempted"] += 1
+                    operator_counts["crossover_effective"] += int(child_expression not in parents)
+                elif operator in {"subtree_mutation", "point_mutation"}:
+                    operator_counts[f"{operator}_attempted"] += 1
+                    operator_counts[f"{operator}_effective"] += int(not same_as_parent)
+                else:
+                    operator_counts["reproduction_count"] += 1
+                operator_counts["offspring_same_as_parent_count"] += int(same_as_parent)
             population = next_population[: self.config.population_size]
+            ids = next_ids[: self.config.population_size]
             candidates = self._evaluate_population(
-                population,
+                population, ids,
                 panel,
                 evaluator,
                 deduplicate=deduplicate,
             )
-            self._record_generation(generation, population, candidates, provenance, operator_counts)
+            self._record_generation(generation, population, ids, candidates, provenance, operator_counts)
         return candidates
 
     def telemetry_frames(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         return pd.DataFrame(self.generation_statistics), pd.DataFrame(self.candidate_audit)
 
-    def _record_generation(self, generation: int, population: list[FactorNode], candidates: list[GPCandidate], provenance: list[dict[str, Any]], operator_counts: dict[str, int] | None = None) -> None:
+    def stage_events_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(self.stage_events)
+
+    def _individual_id(self, generation: int, slot: int) -> str:
+        return f"generation-{generation}-slot-{slot}"
+
+    def _record_generation(self, generation: int, population: list[FactorNode], ids: list[str], candidates: list[GPCandidate], provenance: list[dict[str, Any]], operator_counts: dict[str, int] | None = None) -> None:
         by_expression = {candidate.node.describe(): candidate for candidate in candidates}
         expressions = [node.describe() for node in population]
         fitness = [candidate.evaluation.fitness for candidate in candidates]
@@ -95,16 +126,53 @@ class GPGenerator:
         accepted = [candidate for candidate in candidates if candidate.evaluation.fitness > VERY_BAD_FITNESS]
         accepted_fitness = [candidate.evaluation.fitness for candidate in accepted]
         best = max(accepted, key=lambda candidate: candidate.evaluation.fitness) if accepted else None
-        row = {"generation": generation, "population_size": len(population), "raw_individual_occurrences": len(population), "expression_evaluations": len(candidates), "per_generation_unique_expressions": len(set(expressions)), "duplicate_count": len(population) - len(set(expressions)), "accepted_candidate_count": len(accepted), "best_fitness": best.evaluation.fitness if best else float("nan"), "accepted_mean_fitness": float(np.mean(accepted_fitness)) if accepted_fitness else float("nan"), "accepted_median_fitness": float(np.median(accepted_fitness)) if accepted_fitness else float("nan"), "accepted_fitness_std": float(np.std(accepted_fitness)) if accepted_fitness else float("nan"), "rejection_rate": float(len(rejected) / len(candidates)) if candidates else 0.0, "minimum_complexity": min(complexity) if complexity else 0, "median_complexity": float(np.median(complexity)) if complexity else 0.0, "best_fitness_candidate_complexity": best.node.complexity() if best else 0, "best_fitness_candidate_depth": best.node.depth() if best else 0, "rejected_candidate_count": len(rejected), "rejection_reasons": ";".join(sorted({str(c.evaluation.metrics.get("reject_reason", "unknown")) for c in rejected}))}
-        row.update({f"{name}_count": int((operator_counts or {}).get(name, 0)) for name in ("crossover", "subtree_mutation", "point_mutation", "reproduction")})
+        duplicate_slots = {
+            slot for slot, expression in enumerate(expressions)
+            if expression in expressions[:slot]
+        }
+        offspring_slots = [slot for slot, metadata in enumerate(provenance) if metadata["operator"] != "initial"]
+        novel_offspring_count = sum(slot not in duplicate_slots for slot in offspring_slots)
+        row = {"generation": generation, "population_size": len(population), "raw_individual_occurrences": len(population), "expression_evaluation_calls": len(population), "fast_evaluation_calls": len(population), "fast_unique_expression_survivors": len(candidates), "per_generation_unique_expressions": len(set(expressions)), "duplicate_count": len(population) - len(set(expressions)), "accepted_candidate_count": len(accepted), "best_fitness": best.evaluation.fitness if best else float("nan"), "accepted_mean_fitness": float(np.mean(accepted_fitness)) if accepted_fitness else float("nan"), "accepted_median_fitness": float(np.median(accepted_fitness)) if accepted_fitness else float("nan"), "accepted_fitness_std": float(np.std(accepted_fitness)) if accepted_fitness else float("nan"), "rejection_rate": float(len(rejected) / len(candidates)) if candidates else 0.0, "minimum_complexity": min(complexity) if complexity else 0, "median_complexity": float(np.median(complexity)) if complexity else 0.0, "best_fitness_candidate_complexity": best.node.complexity() if best else 0, "best_fitness_candidate_depth": best.node.depth() if best else 0, "rejected_candidate_count": len(rejected), "rejection_reasons": ";".join(sorted({str(c.evaluation.metrics.get("reject_reason", "unknown")) for c in rejected})), "offspring_duplicate_in_generation_count": sum(slot in duplicate_slots for slot in offspring_slots), "novel_offspring_count": novel_offspring_count, "novel_offspring_rate": float(novel_offspring_count / len(offspring_slots)) if offspring_slots else 0.0}
+        row.update({key: int((operator_counts or {}).get(key, 0)) for key in ("elite_count", "crossover_attempted", "crossover_effective", "subtree_mutation_attempted", "subtree_mutation_effective", "point_mutation_attempted", "point_mutation_effective", "reproduction_count", "offspring_same_as_parent_count")})
         self.generation_statistics.append(row)
         first_seen: dict[str, int] = {}
-        for slot, (node, metadata) in enumerate(zip(population, provenance)):
+        for slot, (node, individual_id, metadata) in enumerate(zip(population, ids, provenance)):
             expression = node.describe(); candidate = by_expression.get(expression)
             duplicate_of = first_seen.get(expression)
             if duplicate_of is None:
                 first_seen[expression] = slot
-            self.candidate_audit.append({"individual_id": f"generation-{generation}-slot-{slot}", "generation": generation, "slot": slot, "expression": expression, "creation_operator": metadata["operator"], "parent_expressions": " | ".join(metadata["parents"]), "parent_individual_ids": "", "complexity": node.complexity(), "depth": node.depth(), "fitness": candidate.evaluation.fitness if candidate else float("nan"), "reject_reason": candidate.evaluation.metrics.get("reject_reason", "") if candidate else "duplicate", "is_exact_duplicate": duplicate_of is not None, "duplicate_of_id": f"generation-{generation}-slot-{duplicate_of}" if duplicate_of is not None else ""})
+            expression_hash = hashlib.sha256(expression.encode("utf-8")).hexdigest()
+            reject_reason = candidate.evaluation.metrics.get("reject_reason", "") if candidate else "duplicate"
+            status = "rejected" if candidate is not None and candidate.evaluation.fitness <= VERY_BAD_FITNESS else "passed"
+            parent_ids = list(metadata["parent_ids"])
+            self.candidate_audit.append({"individual_id": individual_id, "generation": generation, "slot": slot, "expression": expression, "expression_hash": expression_hash, "creation_operator": metadata["operator"], "parent_expressions": " | ".join(metadata["parents"]), "parent_individual_ids": " | ".join(parent_ids), "parent_1_id": parent_ids[0] if parent_ids else "", "parent_2_id": parent_ids[1] if len(parent_ids) > 1 else "", "complexity": node.complexity(), "depth": node.depth(), "fitness": candidate.evaluation.fitness if candidate else float("nan"), "reject_reason": reject_reason, "is_exact_duplicate": duplicate_of is not None, "duplicate_of_id": ids[duplicate_of] if duplicate_of is not None else ""})
+            base = {"individual_id": individual_id, "expression": expression, "expression_hash": expression_hash, "generation": generation, "slot": slot, "reject_reason": reject_reason}
+            self.stage_events.append({**base, "stage": "raw_gp_population", "status": "passed"})
+            self.stage_events.append({**base, "stage": "fast_filter", "status": status})
+            self.stage_events.append({**base, "stage": "exact_expression_dedup", "status": "rejected" if duplicate_of is not None else "passed", "reject_reason": "exact_duplicate" if duplicate_of is not None else ""})
+
+    def record_stage_event(
+        self,
+        candidate: GPCandidate,
+        *,
+        stage: str,
+        status: str,
+        reject_reason: str = "",
+    ) -> None:
+        """Append an observational event without changing GP control flow."""
+        expression = candidate.node.describe()
+        self.stage_events.append(
+            {
+                "individual_id": candidate.individual_id,
+                "expression": expression,
+                "expression_hash": hashlib.sha256(expression.encode("utf-8")).hexdigest(),
+                "generation": None,
+                "slot": None,
+                "stage": stage,
+                "status": status,
+                "reject_reason": reject_reason,
+            }
+        )
 
     def random_tree(self, max_depth: int | None = None) -> FactorNode:
         depth_limit = max_depth if max_depth is not None else self.config.max_depth
@@ -153,20 +221,21 @@ class GPGenerator:
     def _evaluate_population(
         self,
         population: list[FactorNode],
+        individual_ids: list[str],
         panel: pd.DataFrame,
         evaluator: FactorEvaluator,
         deduplicate: bool = True,
     ) -> list[GPCandidate]:
         if not deduplicate:
-            evaluated = [GPCandidate(node=node, evaluation=evaluator.fast_filter(node, panel)) for node in population]
+            evaluated = [GPCandidate(node=node, evaluation=evaluator.fast_filter(node, panel), individual_id=individual_id) for node, individual_id in zip(population, individual_ids)]
             return sorted(evaluated, key=lambda candidate: candidate.evaluation.fitness, reverse=True)
 
         deduped: dict[str, GPCandidate] = {}
-        for node in population:
+        for node, individual_id in zip(population, individual_ids):
             evaluation = evaluator.fast_filter(node, panel)
             expression = node.describe()
             previous = deduped.get(expression)
-            candidate = GPCandidate(node=node, evaluation=evaluation)
+            candidate = GPCandidate(node=node, evaluation=evaluation, individual_id=individual_id)
             if previous is None or evaluation.fitness > previous.evaluation.fitness:
                 deduped[expression] = candidate
         ordered = sorted(deduped.values(), key=lambda candidate: candidate.evaluation.fitness, reverse=True)

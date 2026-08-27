@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 from pathlib import Path
 from typing import Any
 import pickle
@@ -11,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 from utils.random_state import set_global_seed
+from utils.experiment_ledger import ExperimentLedger
+from utils.fitness_trial_ledger import FitnessTrialLedger
 
 from alpha_mining import (
     FitnessConfig,
@@ -73,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def _main(lifecycle: dict[str, Any]) -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     warnings.filterwarnings("ignore", message="An input array is constant; the correlation coefficient is not defined.")
     args = parse_args()
@@ -122,6 +125,46 @@ def main() -> None:
         config=baseline_config,
     )
     save_candidate_pool_artifacts(output_dir, candidate_pool)
+    candidate_pool_identity = build_candidate_pool_identity(output_dir, candidate_pool)
+    experiment_ledger = ExperimentLedger(output_dir.parent)
+    parent_started = experiment_ledger.start(
+        configuration={
+            "workflow": "crypto_fitness_optimization",
+            "seed": args.seed,
+            "trial_count": args.trials,
+            "quick": args.quick,
+            "base_fitness": asdict(baseline_config.fitness),
+            "candidate_pool_identity": candidate_pool_identity,
+            "research_windows": ROLLING_WINDOW_SPECS,
+        },
+        metadata={
+            "entrypoint": "alpha_mining.optimize_crypto_fitness",
+            "output_directory": str(output_dir.resolve()),
+            "candidate_pool": str((output_dir / "candidate_factor_pool.pkl").resolve()),
+        },
+    )
+    trial_ledger = FitnessTrialLedger(output_dir.parent)
+    optimization_started = trial_ledger.start_run(
+        parent_experiment_id=parent_started["experiment_id"],
+        configuration={
+            "seed": args.seed,
+            "trial_count": args.trials,
+            "base_fitness": asdict(baseline_config.fitness),
+            "candidate_pool_identity": candidate_pool_identity,
+        },
+        artifact_locations={
+            "output_directory": str(output_dir.resolve()),
+            "trial_ledger": str(trial_ledger.trials_path.resolve()),
+            "results": str((output_dir / "fitness_search_results.csv").resolve()),
+        },
+    )
+    lifecycle.update({
+        "experiment_ledger": experiment_ledger,
+        "parent_started": parent_started,
+        "trial_ledger": trial_ledger,
+        "optimization_started": optimization_started,
+    })
+    write_json(output_dir / "optimization_run.json", to_jsonable(optimization_started))
 
     candidates = [baseline_config.fitness]
     for _ in range(max(args.trials - 1, 0)):
@@ -130,14 +173,15 @@ def main() -> None:
     results: list[dict[str, Any]] = []
     for trial_index, fitness_cfg in enumerate(candidates, start=1):
         print_progress("fitness-search", trial_index, len(candidates), f"trial {trial_index}")
-        config = build_crypto_workflow_config(
-            output_dir=output_dir / f"trial_{trial_index:03d}" / "registry",
-            symbols=sorted(panel["symbol"].astype(str).unique()),
-            panel=panel,
-            fitness_override=merge_fitness_config(baseline_config.fitness, fitness_cfg),
-            quick=args.quick,
-        )
+        effective_fitness = merge_fitness_config(baseline_config.fitness, fitness_cfg)
         try:
+            config = build_crypto_workflow_config(
+                output_dir=output_dir / f"trial_{trial_index:03d}" / "registry",
+                symbols=sorted(panel["symbol"].astype(str).unique()),
+                panel=panel,
+                fitness_override=effective_fitness,
+                quick=args.quick,
+            )
             selected = select_factors_from_pool(candidate_pool, config, config.fitness)
             result, metrics, _ = backtest_selected_factors(
                 panel=validation_panel,
@@ -150,9 +194,38 @@ def main() -> None:
             eq = summarize_market_baseline(equal_weight_benchmark_df, result["date"], args.initial_capital)
             summary = score_trial(selected, metrics, eq, config.portfolio.min_selected_factor_count)
             row = {"trial": trial_index, "status": "ok", **summary, **asdict(config.fitness)}
+            trial_record = trial_ledger.record_trial(
+                optimization_run_id=optimization_started["optimization_run_id"],
+                parent_experiment_id=parent_started["experiment_id"],
+                trial_index=trial_index,
+                fitness_configuration=asdict(effective_fitness),
+                candidate_pool_identity=candidate_pool_identity,
+                seed=args.seed,
+                status="completed",
+                objective_value=float(summary["objective"]),
+                validation_metrics=to_jsonable(metrics),
+                selected_factor_count=len(selected),
+            )
         except Exception as exc:  # pragma: no cover
-            row = {"trial": trial_index, "status": "error", "objective": -1_000_000_000.0, "error": str(exc), **asdict(config.fitness)}
+            row = {"trial": trial_index, "status": "error", "objective": -1_000_000_000.0, "error": str(exc), **asdict(effective_fitness)}
+            trial_record = trial_ledger.record_trial(
+                optimization_run_id=optimization_started["optimization_run_id"],
+                parent_experiment_id=parent_started["experiment_id"],
+                trial_index=trial_index,
+                fitness_configuration=asdict(effective_fitness),
+                candidate_pool_identity=candidate_pool_identity,
+                seed=args.seed,
+                status="failed",
+                objective_value=-1_000_000_000.0,
+                validation_metrics={},
+                selected_factor_count=0,
+                failure_reason=str(exc),
+            )
+        row["trial_id"] = trial_record["trial_id"]
+        row["optimization_run_id"] = optimization_started["optimization_run_id"]
+        row["parent_experiment_id"] = parent_started["experiment_id"]
         results.append(row)
+        pd.DataFrame(results).to_csv(output_dir / "fitness_search_results_partial.csv", index=False)
 
     results_df = pd.DataFrame(results).sort_values(["objective", "trial"], ascending=[False, True])
     results_df.to_csv(output_dir / "fitness_search_results.csv", index=False)
@@ -160,6 +233,21 @@ def main() -> None:
     best_fitness = FitnessConfig(**{field: float(best[field]) for field in asdict(baseline_config.fitness).keys()})
     write_json(output_dir / "best_fitness_config.json", to_jsonable(asdict(best_fitness)))
     write_json(output_dir / "best_trial_summary.json", to_jsonable(best))
+    durable_trials = trial_ledger.trials_for_run(optimization_started["optimization_run_id"])
+    optimization_summary = build_optimization_summary(
+        optimization_started=optimization_started,
+        trials=durable_trials,
+        winning_trial_id=str(best["trial_id"]),
+        winning_configuration=asdict(best_fitness),
+        artifact_locations={
+            "output_directory": str(output_dir.resolve()),
+            "results": str((output_dir / "fitness_search_results.csv").resolve()),
+            "trials": str(trial_ledger.trials_path.resolve()),
+            "best_fitness": str((output_dir / "best_fitness_config.json").resolve()),
+        },
+    )
+    write_json(output_dir / "optimization_summary.json", to_jsonable(optimization_summary))
+    trial_ledger.complete_run(optimization_started, summary=optimization_summary)
 
     strategy_returns: dict[str, pd.DataFrame] = {}
     ok_trials = results_df.loc[results_df["status"] == "ok"].head(min(12, len(results_df))).copy()
@@ -196,6 +284,7 @@ def main() -> None:
     print(f"Best objective: {best['objective']:.6f}")
 
     if args.skip_final_run:
+        experiment_ledger.complete(parent_started, results={"optimization_summary": str((output_dir / "optimization_summary.json").resolve()), "winning_trial_id": best["trial_id"]})
         return
 
     print_progress("final-run", 1, 3, "writing inputs")
@@ -319,6 +408,24 @@ def main() -> None:
     print(f"Workflow report: {workflow_report_path.resolve()}")
     print(f"Backtest report: {backtest_report_path.resolve()}")
     print_progress("final-run", 3, 3, "completed")
+    experiment_ledger.complete(parent_started, results={"optimization_summary": str((output_dir / "optimization_summary.json").resolve()), "winning_trial_id": best["trial_id"], "workflow_report": str(workflow_report_path.resolve())})
+
+
+def main() -> None:
+    """Wrap the optimizer so a normal exception path closes durable ledgers."""
+    lifecycle: dict[str, Any] = {}
+    try:
+        _main(lifecycle)
+    except BaseException as error:
+        trial_ledger = lifecycle.get("trial_ledger")
+        optimization_started = lifecycle.get("optimization_started")
+        if trial_ledger is not None and optimization_started is not None:
+            trial_ledger.fail_run(optimization_started, error)
+        experiment_ledger = lifecycle.get("experiment_ledger")
+        parent_started = lifecycle.get("parent_started")
+        if experiment_ledger is not None and parent_started is not None:
+            experiment_ledger.fail(parent_started, error)
+        raise
 
 
 def load_or_build_candidate_pool(
@@ -353,6 +460,48 @@ def save_candidate_pool_artifacts(output_dir: Path, candidate_pool: list[Any]) -
         output_dir / "candidate_factor_pool.csv",
         index=False,
     )
+
+
+def build_candidate_pool_identity(output_dir: Path, candidate_pool: list[Any]) -> dict[str, Any]:
+    path = output_dir / "candidate_factor_pool.pkl"
+    expressions = [str(factor.expression) for factor in candidate_pool]
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256_file(path),
+        "factor_count": len(candidate_pool),
+        "expression_sha256": hashlib.sha256("\n".join(expressions).encode("utf-8")).hexdigest(),
+    }
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_optimization_summary(
+    *,
+    optimization_started: dict[str, Any],
+    trials: list[dict[str, Any]],
+    winning_trial_id: str,
+    winning_configuration: dict[str, Any],
+    artifact_locations: dict[str, Any],
+) -> dict[str, Any]:
+    trial_ids = {str(trial["trial_id"]) for trial in trials}
+    if winning_trial_id not in trial_ids:
+        raise ValueError("Winning trial is missing from the durable trial ledger.")
+    return {
+        "optimization_run_id": optimization_started["optimization_run_id"],
+        "parent_experiment_id": optimization_started["parent_experiment_id"],
+        "total_attempted_trials": len(trials),
+        "completed_trials": sum(trial["status"] == "completed" for trial in trials),
+        "failed_trials": sum(trial["status"] == "failed" for trial in trials),
+        "winning_trial_id": winning_trial_id,
+        "winning_configuration": winning_configuration,
+        "artifact_locations": artifact_locations,
+    }
 
 
 def score_trial(

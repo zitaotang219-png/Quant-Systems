@@ -248,8 +248,6 @@ def build_candidate_factor_pool(
         )
 
     population = generator.evolve(filtered_panel, pool_evaluator, deduplicate=config.deduplicate_expressions)
-    if telemetry_callback is not None:
-        telemetry_callback(generator)
     deep_results = _deep_evaluate_population(
         candidates=population,
         panel=scoring_target if scoring_target is not None else filtered_panel,
@@ -257,6 +255,7 @@ def build_candidate_factor_pool(
         keep=resolved_deep_keep,
         fast_keep=resolved_fast_keep,
         split_label=scoring_split if scoring_target is not None else None,
+        telemetry_generator=generator,
     )
     minimum_pool_floor = max(config.portfolio.min_selected_factor_count * 3, config.portfolio.selected_factor_count)
     if len(deep_results) < minimum_pool_floor:
@@ -268,9 +267,25 @@ def build_candidate_factor_pool(
                 config=config,
                 target_size=max(resolved_pool_limit, minimum_pool_floor * 2),
                 split_label=scoring_split if scoring_target is not None else None,
+                telemetry_generator=generator,
             )
         )
-    return _results_to_factor_pool(deep_results, resolved_pool_limit)
+    result = _results_to_factor_pool(deep_results, resolved_pool_limit)
+    if telemetry_callback is not None:
+        source_by_expression = {candidate.node.describe(): candidate for candidate in population}
+        retained = {factor.expression for factor in result}
+        for node, _ in deep_results:
+            candidate = source_by_expression.get(node.describe())
+            if candidate is not None:
+                generator.record_stage_event(
+                    candidate,
+                    stage="new_candidate_pool",
+                    status="passed" if node.describe() in retained else "rejected",
+                    reject_reason="" if node.describe() in retained else "new_pool_limit_or_diversity",
+                )
+    if telemetry_callback is not None:
+        telemetry_callback(generator)
+    return result
 
 
 def build_alpha_mining_strategy(
@@ -688,11 +703,20 @@ def _deep_evaluate_population(
     keep: int,
     fast_keep: int,
     split_label: str | None = None,
+    telemetry_generator: GPGenerator | None = None,
 ) -> list[tuple[Any, EvaluationResult]]:
-    fast_candidates = [candidate for candidate in candidates if candidate.evaluation.fitness > VERY_BAD_FITNESS]
-    fast_candidates = fast_candidates[:fast_keep]
+    viable_candidates = [candidate for candidate in candidates if candidate.evaluation.fitness > VERY_BAD_FITNESS]
+    fast_candidates = viable_candidates[:fast_keep]
+    if telemetry_generator is not None:
+        for index, candidate in enumerate(viable_candidates):
+            telemetry_generator.record_stage_event(
+                candidate,
+                stage="fast_keep",
+                status="passed" if index < fast_keep else "rejected",
+                reject_reason="" if index < fast_keep else "fast_keep_limit",
+            )
 
-    deep_results: list[tuple[Any, EvaluationResult]] = []
+    deep_results: list[tuple[GPCandidate, EvaluationResult]] = []
     split_map = _single_split_map(panel["date"], split_label) if split_label else None
     for candidate in fast_candidates:
         evaluation = (
@@ -700,12 +724,23 @@ def _deep_evaluate_population(
             if split_map is not None
             else evaluator.evaluate(candidate.node, panel)
         )
+        if telemetry_generator is not None:
+            telemetry_generator.record_stage_event(candidate, stage="deep_evaluation", status="passed")
         if evaluation.fitness <= VERY_BAD_FITNESS:
+            if telemetry_generator is not None:
+                telemetry_generator.record_stage_event(
+                    candidate,
+                    stage="deep_evaluation_pass",
+                    status="rejected",
+                    reject_reason=str(evaluation.metrics.get("reject_reason", "very_bad_fitness")),
+                )
             continue
-        deep_results.append((candidate.node, evaluation))
+        if telemetry_generator is not None:
+            telemetry_generator.record_stage_event(candidate, stage="deep_evaluation_pass", status="passed")
+        deep_results.append((candidate, evaluation))
 
     deep_results.sort(key=lambda item: item[1].fitness, reverse=True)
-    return deep_results[:keep]
+    return [(candidate.node, evaluation) for candidate, evaluation in deep_results[:keep]]
 
 
 def _aggregate_evaluations(node: Any, evaluations: list[EvaluationResult]) -> EvaluationResult:
@@ -919,6 +954,7 @@ def _fallback_expand_candidate_pool(
     config: AlphaMiningConfig,
     target_size: int,
     split_label: str | None,
+    telemetry_generator: GPGenerator | None = None,
 ) -> list[tuple[Any, EvaluationResult]]:
     seen_expressions = {node.describe() for node, _ in existing_results}
     relaxed_evaluator = _build_pool_evaluator(config)
@@ -932,7 +968,16 @@ def _fallback_expand_candidate_pool(
             continue
         evaluation = relaxed_evaluator.evaluate_with_splits(candidate.node, panel, split_map)
         if evaluation.fitness <= VERY_BAD_FITNESS:
+            if telemetry_generator is not None:
+                telemetry_generator.record_stage_event(
+                    candidate,
+                    stage="fallback_expansion",
+                    status="rejected",
+                    reject_reason=str(evaluation.metrics.get("reject_reason", "very_bad_fitness")),
+                )
             continue
+        if telemetry_generator is not None:
+            telemetry_generator.record_stage_event(candidate, stage="fallback_expansion", status="passed")
         expanded.append((candidate.node, evaluation))
         seen_expressions.add(expression)
         if len(existing_results) + len(expanded) >= target_size:

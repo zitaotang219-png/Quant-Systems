@@ -45,3 +45,20 @@ def test_telemetry_propagates_evaluator_reject_reason() -> None:
     generation, audit = generator.telemetry_frames()
     assert generation.loc[0, "rejection_reasons"] == "finite_ratio"
     assert set(audit["reject_reason"]) == {"finite_ratio"}
+
+
+def test_vanilla_gp_matches_frozen_phase3a_golden_baseline() -> None:
+    config = GPConfig(
+        population_size=6, generations=1, elitism=1, seed=314,
+        field_names=("volume", "feature"), disallowed_raw_field_names=(),
+    )
+    panel = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "symbol": ["AAA"], "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0], "feature": [1.0]})
+    candidates = GPGenerator(config).evolve(panel, _Evaluator(), deduplicate=False)
+    assert [(candidate.node.describe(), candidate.evaluation.fitness) for candidate in candidates] == [
+        ("volume", -1.0),
+        ("rank(volume)", -2.0),
+        ("rank(volume)", -2.0),
+        ("rank(volume)", -2.0),
+        ("rank(rank(-1.0485140716874808))", -3.0),
+        ("rank(rank(volume))", -3.0),
+    ]
