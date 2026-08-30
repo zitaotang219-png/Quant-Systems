@@ -8,6 +8,33 @@ import pandas as pd
 
 
 @dataclass(frozen=True)
+class ComputeProfile:
+    """Search-budget limits only; every profile uses the same research process."""
+
+    name: str
+    population_size: int
+    generations: int
+    fast_filter_keep: int
+    deep_eval_keep: int
+    validated_pool_limit: int
+    selected_factor_count: int
+    min_selected_factor_count: int
+
+
+COMPUTE_PROFILES: dict[str, ComputeProfile] = {
+    "smoke": ComputeProfile("smoke", 12, 1, 12, 8, 12, 4, 3),
+    "research": ComputeProfile("research", 24, 2, 36, 16, 24, 6, 4),
+    "certified": ComputeProfile("certified", 60, 4, 96, 64, 48, 10, 8),
+}
+
+
+def get_compute_profile(name: str) -> ComputeProfile:
+    try:
+        return COMPUTE_PROFILES[str(name).lower()]
+    except KeyError as exc:
+        raise ValueError(f"Unknown compute profile {name!r}; choose one of {sorted(COMPUTE_PROFILES)}") from exc
+
+@dataclass(frozen=True)
 class GPConfig:
     population_size: int = 80
     generations: int = 8
@@ -119,6 +146,8 @@ class AlphaMiningConfig:
     deduplicate_expressions: bool = True
     save_registry: bool = True
     universe_symbols: tuple[str, ...] = ()
+    compute_profile: str = "certified"
+
 
     def registry_dir(self) -> Path:
         return Path(self.registry.directory)

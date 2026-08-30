@@ -660,6 +660,7 @@ def _build_walk_forward_candidate_pool(
                 deduplicate_expressions=config.deduplicate_expressions,
                 save_registry=config.save_registry,
                 universe_symbols=config.universe_symbols,
+                compute_profile=config.compute_profile,
             ),
             pool_limit=pool_limit,
             fast_keep=fast_keep,
@@ -935,6 +936,7 @@ def _build_relaxed_pool_config(config: AlphaMiningConfig) -> AlphaMiningConfig:
         deduplicate_expressions=config.deduplicate_expressions,
         save_registry=False,
         universe_symbols=config.universe_symbols,
+        compute_profile=config.compute_profile,
     )
 
 

@@ -27,6 +27,7 @@ from alpha_mining import (
     rescore_candidate_pool,
     select_factors_from_pool,
 )
+from alpha_mining.config import COMPUTE_PROFILES, get_compute_profile
 from alpha_mining.pipeline import _build_pool_evaluator, _single_split_map
 from alpha_mining.search_funnel import build_search_funnel
 from alpha_mining.search_funnel import build_hypothesis_statistics
@@ -144,7 +145,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-capital", type=float, default=DEFAULT_INITIAL_CAPITAL, help="Initial capital for backtest.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory to write workflow outputs.")
     parser.add_argument("--fitness-config", default=None, help="Optional JSON file with FitnessConfig overrides.")
-    parser.add_argument("--quick", action="store_true", help="Use lighter GP/pool settings for fast smoke runs.")
+    parser.add_argument("--quick", action="store_true", help="Deprecated alias for --compute-profile smoke.")
+    parser.add_argument("--compute-profile", choices=sorted(COMPUTE_PROFILES), default="research", help="Search budget only; validation methodology is unchanged.")
     parser.add_argument("--research-only", action="store_true", help="Run rolling research and diagnostics without final-backtest execution.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible GP candidate generation.")
     return parser.parse_args()
@@ -269,6 +271,7 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         panel=panel,
         fitness_override=fitness_override,
         quick=args.quick,
+        compute_profile="smoke" if args.quick else args.compute_profile,
         seed=args.seed,
     )
     config = config.__class__(
@@ -289,6 +292,7 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         deduplicate_expressions=config.deduplicate_expressions,
         save_registry=True,
         universe_symbols=config.universe_symbols,
+        compute_profile=config.compute_profile,
     )
     config_payload = to_jsonable(asdict(config))
     write_json(output_dir / "workflow_config.json", config_payload)
@@ -897,12 +901,14 @@ def build_crypto_workflow_config(
     panel: pd.DataFrame,
     fitness_override: FitnessConfig | None = None,
     quick: bool = False,
+    compute_profile: str | None = None,
     seed: int = 42,
 ) -> AlphaMiningConfig:
+    profile = get_compute_profile(compute_profile or ("smoke" if quick else "certified"))
     feature_fields = tuple(engineered_crypto_feature_columns(panel))
     gp = GPConfig(
-        population_size=40 if quick else 60,
-        generations=3 if quick else 4,
+        population_size=profile.population_size,
+        generations=profile.generations,
         tournament_size=5,
         elitism=8,
         max_depth=5,
@@ -959,8 +965,8 @@ def build_crypto_workflow_config(
         factor_regime_weight_overrides={},
     )
     portfolio = PortfolioConfig(
-        selected_factor_count=8 if quick else 10,
-        min_selected_factor_count=6 if quick else 8,
+        selected_factor_count=profile.selected_factor_count,
+        min_selected_factor_count=profile.min_selected_factor_count,
         max_pairwise_correlation=0.45,
         factor_weight_scheme="equal",
         weighting_scheme="continuous",
@@ -996,11 +1002,12 @@ def build_crypto_workflow_config(
         portfolio=portfolio,
         registry=registry,
         live_mode=False,
-        fast_filter_keep=20 if quick else 36,
-        deep_eval_keep=10 if quick else 18,
+        fast_filter_keep=profile.fast_filter_keep,
+        deep_eval_keep=profile.deep_eval_keep,
         walk_forward_enabled=True,
         save_registry=True,
         universe_symbols=tuple(symbols),
+        compute_profile=profile.name,
     )
 
 
@@ -1074,6 +1081,7 @@ def clone_config_with_fitness(config: AlphaMiningConfig, fitness: FitnessConfig,
         deduplicate_expressions=config.deduplicate_expressions,
         save_registry=save_registry,
         universe_symbols=config.universe_symbols,
+        compute_profile=config.compute_profile,
     )
 
 
@@ -1283,9 +1291,9 @@ def run_rolling_pool_workflow(
         new_pool = build_candidate_factor_pool(
             panel=effective_train_panel,
             config=window_config,
-            pool_limit=ROLLING_WINDOW_POOL_LIMIT,
-            fast_keep=min(ROLLING_WINDOW_FAST_KEEP, max(window_config.fast_filter_keep, 72)),
-            deep_keep=max(ROLLING_WINDOW_DEEP_KEEP, window_config.deep_eval_keep),
+            pool_limit=get_compute_profile(window_config.compute_profile).validated_pool_limit,
+            fast_keep=window_config.fast_filter_keep,
+            deep_keep=window_config.deep_eval_keep,
             scoring_panel=validation_panel,
             scoring_split="validation",
             telemetry_callback=capture_telemetry,
@@ -1314,7 +1322,7 @@ def run_rolling_pool_workflow(
             ),
         )
         stage_event_rows.append(pd.DataFrame(validation_events))
-        pool = trim_candidate_pool(validated_pool, ROLLING_POOL_LIMIT)
+        pool = trim_candidate_pool(validated_pool, get_compute_profile(config.compute_profile).validated_pool_limit)
         retained_after_trim = {factor.expression for factor in pool}
         stage_event_rows.append(pd.DataFrame([
             stage_event(
@@ -1349,7 +1357,7 @@ def run_rolling_pool_workflow(
 
     final_fitness = fitness_profiles["balanced"]
     final_pool = rescore_candidate_pool(pool, final_fitness)
-    final_pool = trim_candidate_pool(final_pool, ROLLING_POOL_LIMIT)
+    final_pool = trim_candidate_pool(final_pool, get_compute_profile(config.compute_profile).validated_pool_limit)
     selected = select_factors_from_pool(final_pool, clone_config_with_fitness(config, final_fitness), final_fitness)
     selected_expressions = {factor.expression for factor in selected}
     stage_event_rows.append(pd.DataFrame([
@@ -1377,7 +1385,7 @@ def run_rolling_pool_workflow(
             "window_count": int(len(window_rows)),
             "purge_bars": int(purge_bars),
             "embargo_bars": int(embargo_bars),
-            "pool_limit": int(ROLLING_POOL_LIMIT),
+            "pool_limit": int(get_compute_profile(config.compute_profile).validated_pool_limit),
             "final_pool_size": int(len(final_pool)),
             "final_selected_factor_count": int(len(selected[: min(len(selected), 30)])),
             "windows": window_rows,
