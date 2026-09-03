@@ -108,7 +108,7 @@ def _similarity(signals: pd.DataFrame, daily_ic: pd.DataFrame) -> tuple[pd.DataF
     for i,left in enumerate(names):
         cluster=i
         for right in names[i+1:]:
-            rows.append({"factor_left":left,"factor_right":right,"signal_correlation":float(signal_corr.loc[left,right]),"return_correlation":float(return_corr.loc[left,right])})
+            rows.append({"factor_left":left,"factor_right":right,"signal_correlation":float(signal_corr.loc[left,right]),"ic_series_correlation":float(return_corr.loc[left,right])})
             if abs(float(signal_corr.loc[left,right]))>=0.8: cluster=min(cluster,names.index(right))
         clusters.append({"factor":left,"cluster_id":int(cluster)})
     return pd.DataFrame(rows),pd.DataFrame(clusters)

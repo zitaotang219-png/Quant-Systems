@@ -43,8 +43,13 @@ class GPGenerator:
         self.generation_statistics: list[dict[str, Any]] = []
         self.candidate_audit: list[dict[str, Any]] = []
         self.stage_events: list[dict[str, Any]] = []
+        self._archive: dict[str, GPCandidate] = {}
 
     def evolve(self, panel: pd.DataFrame, evaluator: FactorEvaluator, deduplicate: bool = True) -> list[GPCandidate]:
+        self._archive = {}
+        prepare_panel = getattr(evaluator, "prepare_panel", None)
+        if callable(prepare_panel):
+            panel = prepare_panel(panel)
         population = [self.random_tree(max_depth=self.config.init_max_depth) for _ in range(self.config.population_size)]
         ids = [self._individual_id(0, slot) for slot in range(len(population))]
         provenance = [{"operator": "initial", "parents": [], "parent_ids": []} for _ in population]
@@ -107,6 +112,10 @@ class GPGenerator:
             )
             self._record_generation(generation, population, ids, candidates, provenance, operator_counts)
         return candidates
+
+    def archive_candidates(self) -> list[GPCandidate]:
+        """Unique first-seen hypotheses across generations, ranked by fast fitness."""
+        return sorted(self._archive.values(), key=lambda candidate: candidate.evaluation.fitness, reverse=True)
 
     def telemetry_frames(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         return pd.DataFrame(self.generation_statistics), pd.DataFrame(self.candidate_audit)
@@ -228,7 +237,10 @@ class GPGenerator:
     ) -> list[GPCandidate]:
         if not deduplicate:
             evaluated = [GPCandidate(node=node, evaluation=evaluator.fast_filter(node, panel), individual_id=individual_id) for node, individual_id in zip(population, individual_ids)]
-            return sorted(evaluated, key=lambda candidate: candidate.evaluation.fitness, reverse=True)
+            ordered = sorted(evaluated, key=lambda candidate: candidate.evaluation.fitness, reverse=True)
+            for candidate in ordered:
+                self._archive.setdefault(candidate.node.describe(), candidate)
+            return ordered
 
         deduped: dict[str, GPCandidate] = {}
         for node, individual_id in zip(population, individual_ids):
@@ -239,6 +251,8 @@ class GPGenerator:
             if previous is None or evaluation.fitness > previous.evaluation.fitness:
                 deduped[expression] = candidate
         ordered = sorted(deduped.values(), key=lambda candidate: candidate.evaluation.fitness, reverse=True)
+        for candidate in ordered:
+            self._archive.setdefault(candidate.node.describe(), candidate)
         return ordered
 
     def _operator_thresholds(self) -> dict[str, float]:

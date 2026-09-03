@@ -1,0 +1,6 @@
+{
+  "parameters": {
+    "lookback": 20
+  },
+  "seed": 42
+}

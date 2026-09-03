@@ -84,6 +84,9 @@ class FactorEvaluator:
     fitness_config: FitnessConfig = field(default_factory=FitnessConfig)
     cache: dict[str, EvaluationResult] = field(default_factory=dict)
 
+    def prepare_panel(self, panel: pd.DataFrame) -> pd.DataFrame:
+        """Prepare one immutable evaluation panel for reuse within its exact scope."""
+        return _prepare_panel(panel, trading_convention=self.trading_convention)
     def fast_filter(self, node: FactorNode, panel: pd.DataFrame) -> EvaluationResult:
         return self._evaluate(node=node, panel=panel, deep=False)
 
@@ -91,10 +94,7 @@ class FactorEvaluator:
         return self._evaluate(node=node, panel=panel, deep=True)
 
     def _evaluate(self, node: FactorNode, panel: pd.DataFrame, deep: bool) -> EvaluationResult:
-        prepared = _prepare_panel(
-            panel,
-            trading_convention=self.trading_convention,
-        )
+        prepared = panel if "future_return" in panel.columns else self.prepare_panel(panel)
         key = f"{_panel_fingerprint(prepared)}|{node.describe()}|deep={int(deep)}"
         cached = self.cache.get(key)
         if cached is not None:
@@ -159,10 +159,7 @@ class FactorEvaluator:
         panel: pd.DataFrame,
         split_map: dict[pd.Timestamp, str],
     ) -> EvaluationResult:
-        prepared = _prepare_panel(
-            panel,
-            trading_convention=self.trading_convention,
-        )
+        prepared = panel if "future_return" in panel.columns else self.prepare_panel(panel)
         raw_values = node.evaluate(prepared).astype(float)
         finite_ratio = float(np.isfinite(raw_values.to_numpy(dtype=float, na_value=np.nan)).mean())
         if finite_ratio < self.min_finite_ratio:

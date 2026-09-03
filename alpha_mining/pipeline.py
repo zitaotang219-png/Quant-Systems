@@ -540,7 +540,8 @@ def _run_single_pass_alpha_mining(
     evaluator: FactorEvaluator,
     generator: GPGenerator,
 ) -> list[SelectedFactor]:
-    population = generator.evolve(panel, evaluator, deduplicate=config.deduplicate_expressions)
+    generator.evolve(panel, evaluator, deduplicate=config.deduplicate_expressions)
+    population = generator.archive_candidates()
     deep_results = _deep_evaluate_population(
         candidates=population,
         panel=panel,
@@ -706,6 +707,7 @@ def _deep_evaluate_population(
     split_label: str | None = None,
     telemetry_generator: GPGenerator | None = None,
 ) -> list[tuple[Any, EvaluationResult]]:
+    prepared = evaluator.prepare_panel(panel)
     viable_candidates = [candidate for candidate in candidates if candidate.evaluation.fitness > VERY_BAD_FITNESS]
     fast_candidates = viable_candidates[:fast_keep]
     if telemetry_generator is not None:
@@ -718,12 +720,12 @@ def _deep_evaluate_population(
             )
 
     deep_results: list[tuple[GPCandidate, EvaluationResult]] = []
-    split_map = _single_split_map(panel["date"], split_label) if split_label else None
+    split_map = _single_split_map(prepared["date"], split_label) if split_label else None
     for candidate in fast_candidates:
         evaluation = (
-            evaluator.evaluate_with_splits(candidate.node, panel, split_map)
+            evaluator.evaluate_with_splits(candidate.node, prepared, split_map)
             if split_map is not None
-            else evaluator.evaluate(candidate.node, panel)
+            else evaluator.evaluate(candidate.node, prepared)
         )
         if telemetry_generator is not None:
             telemetry_generator.record_stage_event(candidate, stage="deep_evaluation", status="passed")
@@ -968,7 +970,7 @@ def _fallback_expand_candidate_pool(
         expression = candidate.node.describe()
         if expression in seen_expressions:
             continue
-        evaluation = relaxed_evaluator.evaluate_with_splits(candidate.node, panel, split_map)
+        evaluation = relaxed_evaluator.evaluate_with_splits(candidate.node, prepared, split_map)
         if evaluation.fitness <= VERY_BAD_FITNESS:
             if telemetry_generator is not None:
                 telemetry_generator.record_stage_event(
