@@ -1019,47 +1019,20 @@ def slice_panel_by_date(panel: pd.DataFrame, start: str, end: str) -> pd.DataFra
 
 
 def build_window_fitness_profiles(base: FitnessConfig) -> dict[str, FitnessConfig]:
-    return {
-        "defensive": FitnessConfig(
-            fast_rank_ic_weight=base.fast_rank_ic_weight,
-            validation_ic_weight=10.0,
-            sharpe_weight=2.2,
-            cumulative_return_weight=2.5,
-            excess_return_weight=5.5,
-            stability_weight=9.0,
-            bear_return_weight=12.0,
-            bear_sharpe_weight=3.0,
-            turnover_penalty=6.5,
-            drawdown_penalty=26.0,
-            complexity_penalty=0.11,
-        ),
-        "aggressive": FitnessConfig(
-            fast_rank_ic_weight=max(base.fast_rank_ic_weight, 6.0),
-            validation_ic_weight=10.0,
-            sharpe_weight=1.4,
-            cumulative_return_weight=4.0,
-            excess_return_weight=7.0,
-            stability_weight=6.0,
-            bear_return_weight=6.0,
-            bear_sharpe_weight=1.2,
-            turnover_penalty=4.0,
-            drawdown_penalty=18.0,
-            complexity_penalty=0.08,
-        ),
-        "balanced": FitnessConfig(
-            fast_rank_ic_weight=base.fast_rank_ic_weight,
-            validation_ic_weight=10.0,
-            sharpe_weight=1.8,
-            cumulative_return_weight=3.5,
-            excess_return_weight=6.0,
-            stability_weight=8.0,
-            bear_return_weight=9.0,
-            bear_sharpe_weight=2.0,
-            turnover_penalty=5.0,
-            drawdown_penalty=22.0,
-            complexity_penalty=0.09,
-        ),
-    }
+    unified = FitnessConfig(
+        fast_rank_ic_weight=base.fast_rank_ic_weight,
+        validation_ic_weight=25.0,
+        sharpe_weight=0.0,
+        cumulative_return_weight=0.0,
+        excess_return_weight=0.0,
+        stability_weight=8.0,
+        bear_return_weight=0.0,
+        bear_sharpe_weight=0.0,
+        turnover_penalty=4.0,
+        drawdown_penalty=0.0,
+        complexity_penalty=0.10,
+    )
+    return {name: unified for name in ("defensive", "aggressive", "balanced")}
 
 
 def clone_config_with_fitness(config: AlphaMiningConfig, fitness: FitnessConfig, save_registry: bool = False) -> AlphaMiningConfig:

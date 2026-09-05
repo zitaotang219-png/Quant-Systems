@@ -1,1 +1,0 @@
-{"artifact_locations": {"output_directory": "reports/test"}, "configuration": {"seed": 17, "trials": 3}, "created_at_utc": "2026-08-30T19:56:04.747781+00:00", "event": "started", "optimization_run_id": "b83e57f0-f356-47ee-bc7d-4e41927ea695", "parent_experiment_id": "experiment-parent", "status": "started"}

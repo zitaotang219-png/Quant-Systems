@@ -231,8 +231,10 @@ def build_candidate_factor_pool(
         config.fast_filter_keep * 3,
         config.portfolio.selected_factor_count * 12,
     )
-    resolved_fast_keep = fast_keep or max(config.fast_filter_keep, resolved_pool_limit)
-    resolved_deep_keep = deep_keep or resolved_pool_limit
+    requested_fast_keep = config.fast_filter_keep if fast_keep is None else fast_keep
+    requested_deep_keep = config.deep_eval_keep if deep_keep is None else deep_keep
+    resolved_fast_keep = min(requested_fast_keep, config.fast_filter_keep)
+    resolved_deep_keep = min(requested_deep_keep, config.deep_eval_keep, resolved_fast_keep)
 
     scoring_target = _filter_universe(scoring_panel, config.universe_symbols) if scoring_panel is not None else None
 
@@ -247,9 +249,10 @@ def build_candidate_factor_pool(
             deep_keep=resolved_deep_keep,
         )
 
-    population = generator.evolve(filtered_panel, pool_evaluator, deduplicate=config.deduplicate_expressions)
+    generator.evolve(filtered_panel, pool_evaluator, deduplicate=config.deduplicate_expressions)
+    candidates = generator.archive_candidates()
     deep_results = _deep_evaluate_population(
-        candidates=population,
+        candidates=candidates,
         panel=scoring_target if scoring_target is not None else filtered_panel,
         evaluator=pool_evaluator,
         keep=resolved_deep_keep,
@@ -257,22 +260,9 @@ def build_candidate_factor_pool(
         split_label=scoring_split if scoring_target is not None else None,
         telemetry_generator=generator,
     )
-    minimum_pool_floor = max(config.portfolio.min_selected_factor_count * 3, config.portfolio.selected_factor_count)
-    if len(deep_results) < minimum_pool_floor:
-        deep_results.extend(
-            _fallback_expand_candidate_pool(
-                candidates=population,
-                existing_results=deep_results,
-                panel=scoring_target if scoring_target is not None else filtered_panel,
-                config=config,
-                target_size=max(resolved_pool_limit, minimum_pool_floor * 2),
-                split_label=scoring_split if scoring_target is not None else None,
-                telemetry_generator=generator,
-            )
-        )
     result = _results_to_factor_pool(deep_results, resolved_pool_limit)
     if telemetry_callback is not None:
-        source_by_expression = {candidate.node.describe(): candidate for candidate in population}
+        source_by_expression = {candidate.node.describe(): candidate for candidate in candidates}
         retained = {factor.expression for factor in result}
         for node, _ in deep_results:
             candidate = source_by_expression.get(node.describe())
@@ -579,8 +569,8 @@ def _run_walk_forward_alpha_mining(
         full_fold_panel = fold["full_panel"]
         split_map = fold["split_map"]
 
-        population = generator.evolve(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
-        candidates = [candidate for candidate in population if candidate.evaluation.fitness > VERY_BAD_FITNESS]
+        generator.evolve(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
+        candidates = [candidate for candidate in generator.archive_candidates() if candidate.evaluation.fitness > VERY_BAD_FITNESS]
         candidates = candidates[: config.fast_filter_keep]
 
         fold_results: list[tuple[Any, EvaluationResult]] = []
@@ -674,8 +664,8 @@ def _build_walk_forward_candidate_pool(
         full_fold_panel = fold["full_panel"]
         split_map = fold["split_map"]
 
-        population = generator.evolve(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
-        candidates = [candidate for candidate in population if candidate.evaluation.fitness > VERY_BAD_FITNESS]
+        generator.evolve(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
+        candidates = [candidate for candidate in generator.archive_candidates() if candidate.evaluation.fitness > VERY_BAD_FITNESS]
         candidates = candidates[:fast_keep]
 
         fold_results: list[tuple[Any, EvaluationResult]] = []
@@ -710,6 +700,7 @@ def _deep_evaluate_population(
     prepared = evaluator.prepare_panel(panel)
     viable_candidates = [candidate for candidate in candidates if candidate.evaluation.fitness > VERY_BAD_FITNESS]
     fast_candidates = viable_candidates[:fast_keep]
+    deep_candidates = fast_candidates[:keep]
     if telemetry_generator is not None:
         for index, candidate in enumerate(viable_candidates):
             telemetry_generator.record_stage_event(
@@ -721,7 +712,7 @@ def _deep_evaluate_population(
 
     deep_results: list[tuple[GPCandidate, EvaluationResult]] = []
     split_map = _single_split_map(prepared["date"], split_label) if split_label else None
-    for candidate in fast_candidates:
+    for candidate in deep_candidates:
         evaluation = (
             evaluator.evaluate_with_splits(candidate.node, prepared, split_map)
             if split_map is not None
@@ -851,27 +842,8 @@ def _build_evaluator(
 
 
 def _build_pool_gp_config(config: AlphaMiningConfig):
-    pool_size = max(config.gp.population_size, config.fast_filter_keep * 2, config.portfolio.selected_factor_count * 10)
-    generations = max(config.gp.generations, 6)
-    elitism = max(config.gp.elitism, max(6, pool_size // 10))
-    return config.gp.__class__(
-        population_size=pool_size,
-        generations=generations,
-        tournament_size=min(config.gp.tournament_size, 4),
-        elitism=elitism,
-        max_depth=config.gp.max_depth,
-        init_max_depth=config.gp.init_max_depth,
-        crossover_rate=config.gp.crossover_rate,
-        subtree_mutation_rate=config.gp.subtree_mutation_rate,
-        point_mutation_rate=config.gp.point_mutation_rate,
-        reproduction_rate=config.gp.reproduction_rate,
-        seed=config.gp.seed,
-        field_names=config.gp.field_names,
-        constant_range=config.gp.constant_range,
-        periods_choices=config.gp.periods_choices,
-        window_choices=config.gp.window_choices,
-        wrap_final_with_rank_or_zscore=config.gp.wrap_final_with_rank_or_zscore,
-    )
+    """Use the configured compute-profile GP budget without hidden expansion."""
+    return config.gp
 
 
 def _build_relaxed_pool_config(config: AlphaMiningConfig) -> AlphaMiningConfig:
@@ -907,29 +879,16 @@ def _build_relaxed_pool_config(config: AlphaMiningConfig) -> AlphaMiningConfig:
         regime_benchmark_blend=dict(config.portfolio.regime_benchmark_blend),
         regime_benchmark_direction=dict(config.portfolio.regime_benchmark_direction),
     )
-    relaxed_fitness = config.fitness.__class__(
-        fast_rank_ic_weight=min(config.fitness.fast_rank_ic_weight, 5.0),
-        validation_ic_weight=config.fitness.validation_ic_weight,
-        sharpe_weight=config.fitness.sharpe_weight,
-        cumulative_return_weight=config.fitness.cumulative_return_weight,
-        excess_return_weight=config.fitness.excess_return_weight,
-        stability_weight=config.fitness.stability_weight,
-        bear_return_weight=config.fitness.bear_return_weight,
-        bear_sharpe_weight=config.fitness.bear_sharpe_weight,
-        turnover_penalty=max(config.fitness.turnover_penalty, 4.0),
-        drawdown_penalty=max(config.fitness.drawdown_penalty, 16.0),
-        complexity_penalty=max(config.fitness.complexity_penalty, 0.08),
-    )
     return AlphaMiningConfig(
         gp=config.gp,
         evaluation=relaxed_evaluation,
-        fitness=relaxed_fitness,
+        fitness=config.fitness,
         regime=config.regime,
         portfolio=relaxed_portfolio,
         registry=config.registry,
         live_mode=config.live_mode,
-        fast_filter_keep=max(config.fast_filter_keep, config.portfolio.selected_factor_count * 6),
-        deep_eval_keep=max(config.deep_eval_keep, config.portfolio.selected_factor_count * 6),
+        fast_filter_keep=config.fast_filter_keep,
+        deep_eval_keep=config.deep_eval_keep,
         walk_forward_enabled=False,
         walk_forward_train_fraction=config.walk_forward_train_fraction,
         walk_forward_validation_fraction=config.walk_forward_validation_fraction,

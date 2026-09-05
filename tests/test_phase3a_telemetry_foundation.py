@@ -104,6 +104,9 @@ def test_hypothesis_counting_keeps_global_and_window_concepts_separate() -> None
     assert stats["raw_individual_occurrences"] == 3
     assert stats["unique_expressions_global"] == 1
     assert stats["unique_window_expression_pairs"] == 2
+    assert stats["unique_archived_candidates"] == 2
+    assert stats["fast_evaluation_calls"] == 2
+    assert stats["deep_evaluation_calls"] == 0
     assert stats["per_window"]["window_1"]["unique_expressions"] == 1
 
 

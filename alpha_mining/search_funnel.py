@@ -52,7 +52,7 @@ def build_search_funnel(events: pd.DataFrame) -> pd.DataFrame:
                 "reject_count": int(len(rejected)),
                 "unique_expression_count": int(len(hashes)),
                 "cumulative_unique_expression_count": int(len(seen_hashes)),
-                "evaluation_count": int(len(subset)) if stage in {"fast_evaluation", "deep_evaluation", "fallback_expansion"} else 0,
+                "evaluation_count": int(len(subset)) if stage in {"fast_filter", "deep_evaluation", "fallback_expansion"} else 0,
                 "rejection_reasons": ";".join(sorted(reason for reason in reasons.unique() if reason)),
             })
     return pd.DataFrame(rows)
@@ -62,11 +62,15 @@ def build_hypothesis_statistics(events: pd.DataFrame, selected_factor_count: int
     """Keep occurrence, evaluation, and unique-hypothesis concepts separate."""
     raw = events.loc[events["stage"] == "raw_gp_population"].copy()
     fast = events.loc[events["stage"] == "fast_filter"].copy()
+    deep = events.loc[events["stage"] == "deep_evaluation"].copy()
     if raw.empty:
         return {
             "raw_individual_occurrences": 0,
             "expression_evaluation_calls": 0,
+            "fast_evaluation_calls": 0,
+            "deep_evaluation_calls": 0,
             "unique_expressions_global": 0,
+            "unique_archived_candidates": 0,
             "unique_window_expression_pairs": 0,
             "selected_factor_count": int(selected_factor_count),
             "per_window": {},
@@ -78,12 +82,16 @@ def build_hypothesis_statistics(events: pd.DataFrame, selected_factor_count: int
             "raw_individual_occurrences": int(len(subset)),
             "unique_expressions": int(subset["expression_hash"].nunique()),
             "expression_evaluation_calls": int((fast["window"] == window).sum()),
+            "deep_evaluation_calls": int((deep["window"] == window).sum()),
         }
     return {
         "raw_individual_occurrences": int(len(raw)),
         "expression_evaluation_calls": int(len(fast)),
+        "fast_evaluation_calls": int(len(fast)),
+        "deep_evaluation_calls": int(len(deep)),
         "unique_expressions_global": int(raw["expression_hash"].nunique()),
         "unique_window_expression_pairs": int(raw[["window", "expression_hash"]].drop_duplicates().shape[0]),
+        "unique_archived_candidates": int(raw[["window", "expression_hash"]].drop_duplicates().shape[0]),
         "selected_factor_count": int(selected_factor_count),
         "per_window": per_window,
     }
