@@ -1,5 +1,5 @@
 from alpha_mining.config import AlphaMiningConfig, COMPUTE_PROFILES, FitnessConfig, GPConfig, get_compute_profile
-from alpha_mining.pipeline import _build_pool_gp_config, _build_relaxed_pool_config
+from alpha_mining.pipeline import _build_pool_gp_config
 from alpha_mining.run_crypto_workflow import build_window_fitness_profiles
 
 
@@ -56,4 +56,3 @@ def test_rolling_windows_share_the_factor_research_fitness() -> None:
     assert fitness.drawdown_penalty == 0.0
     assert fitness.bear_return_weight == 0.0
     assert fitness.bear_sharpe_weight == 0.0
-    assert _build_relaxed_pool_config(AlphaMiningConfig(fitness=fitness)).fitness == fitness

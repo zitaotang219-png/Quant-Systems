@@ -11,10 +11,10 @@ from backtest.trading_convention import DEFAULT_TRADING_CONVENTION, TradingConve
 
 from .config import FitnessConfig
 from .dsl import FactorNode
+from .evaluation_types import EvaluationResult, VERY_BAD_FITNESS
 from .portfolio_construction import build_weight_frame
 from .regime import build_regime_frame
 
-VERY_BAD_FITNESS = -1_000_000_000.0
 MIN_FINITE_RATIO = 0.6
 MIN_STD = 1e-6
 
@@ -36,19 +36,6 @@ def compute_factor_fitness(
         - fitness_config.drawdown_penalty * float(metrics.get("max_drawdown", 0.0))
         - fitness_config.complexity_penalty * float(complexity)
     )
-
-
-@dataclass
-class EvaluationResult:
-    node: FactorNode
-    values: pd.Series
-    finite_ratio: float
-    fitness: float
-    direction: int
-    metrics: dict[str, Any] = field(default_factory=dict)
-    daily_returns: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
-    cumulative_return: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
-    split_metrics: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass

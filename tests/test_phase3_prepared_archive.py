@@ -4,10 +4,11 @@ import pandas as pd
 import pandas.testing as pdt
 
 from alpha_mining.config import AlphaMiningConfig, GPConfig
-from alpha_mining.evaluator import EvaluationResult, FactorEvaluator
+from alpha_mining.evaluation_types import EvaluationResult
 from alpha_mining.gp_generator import GPCandidate, GPGenerator
 from alpha_mining.dsl import field, rank, zscore
 from alpha_mining.pipeline import _deep_evaluate_population, build_candidate_factor_pool
+from alpha_mining.research_evaluator import FactorResearchEvaluator
 
 
 def _panel() -> pd.DataFrame:
@@ -19,7 +20,7 @@ def _panel() -> pd.DataFrame:
 
 
 def test_prepared_panel_preserves_fast_evaluation() -> None:
-    evaluator = FactorEvaluator(min_abs_rank_ic=0.0)
+    evaluator = FactorResearchEvaluator(min_abs_rank_ic=0.0)
     raw = evaluator.fast_filter(field("volume"), _panel())
     prepared = evaluator.prepare_panel(_panel())
     reused = evaluator.fast_filter(field("volume"), prepared)
@@ -32,7 +33,7 @@ def test_prepared_panel_preserves_fast_evaluation() -> None:
 def test_archive_is_unique_and_does_not_change_final_population() -> None:
     config = GPConfig(population_size=8, generations=2, elitism=2, seed=17, field_names=("volume",), disallowed_raw_field_names=())
     generator = GPGenerator(config)
-    final_population = generator.evolve(_panel(), FactorEvaluator(min_abs_rank_ic=0.0))
+    final_population = generator.evolve(_panel(), FactorResearchEvaluator(min_abs_rank_ic=0.0))
     archive = generator.archive_candidates()
     assert len({candidate.node.describe() for candidate in archive}) == len(archive)
     assert {candidate.node.describe() for candidate in final_population}.issubset({candidate.node.describe() for candidate in archive})
@@ -60,10 +61,7 @@ def test_candidate_pool_screens_the_cross_generation_archive(monkeypatch) -> Non
         def __init__(self, config):
             pass
 
-        def evolve(self, panel, evaluator, deduplicate=True):
-            return [final_candidate]
-
-        def archive_candidates(self):
+        def generate(self, panel, evaluator, deduplicate=True):
             return [archived_candidate]
 
     def capture_deep(**kwargs):
@@ -71,7 +69,7 @@ def test_candidate_pool_screens_the_cross_generation_archive(monkeypatch) -> Non
         return []
 
     monkeypatch.setattr("alpha_mining.pipeline.GPGenerator", FakeGenerator)
-    monkeypatch.setattr("alpha_mining.pipeline._build_pool_evaluator", lambda config: object())
+    monkeypatch.setattr("alpha_mining.pipeline._build_research_evaluator", lambda config: object())
     monkeypatch.setattr("alpha_mining.pipeline._deep_evaluate_population", capture_deep)
     build_candidate_factor_pool(_panel(), AlphaMiningConfig(), pool_limit=1, fast_keep=1, deep_keep=1)
     assert captured["candidates"] == [archived_candidate]
@@ -90,7 +88,10 @@ def test_deep_evaluation_calls_are_strictly_capped() -> None:
         def prepare_panel(self, panel):
             return panel
 
-        def evaluate(self, node, panel):
+        def create_context(self, panel, **kwargs):
+            return panel
+
+        def evaluate_context(self, node, context, mode):
             calls.append(node.describe())
             return EvaluationResult(
                 node=node,

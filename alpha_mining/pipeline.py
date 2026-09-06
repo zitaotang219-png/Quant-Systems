@@ -14,15 +14,12 @@ from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
 from execution.cost_model import TransactionCostModel
 
 from .config import AlphaMiningConfig, SelectedFactor
-from .evaluator import (
-    FactorEvaluator,
-    EvaluationResult,
-    VERY_BAD_FITNESS,
-    _prepare_panel,
-    compute_factor_fitness,
-)
-from .gp_generator import GPCandidate, GPGenerator
+from .evaluation_types import EvaluationResult, VERY_BAD_FITNESS
+from .evaluator import FactorEvaluator, _prepare_panel
+from .gp_generator import GPGenerator
+from .hypothesis import HypothesisCandidate, HypothesisGenerator
 from .portfolio_construction import build_weight_frame, combine_factor_columns
+from .research_evaluator import FactorResearchEvaluator, compute_research_fitness
 from .regime import build_regime_frame
 from .registry import FactorRegistry
 
@@ -199,7 +196,7 @@ def run_alpha_mining(panel: pd.DataFrame, config: AlphaMiningConfig) -> list[Sel
     if config.live_mode:
         return registry.load(config)
 
-    evaluator = _build_evaluator(config)
+    evaluator = _build_research_evaluator(config)
     generator = GPGenerator(config.gp)
 
     if config.walk_forward_enabled:
@@ -221,11 +218,16 @@ def build_candidate_factor_pool(
     scoring_panel: pd.DataFrame | None = None,
     scoring_split: str = "validation",
     telemetry_callback: Any | None = None,
+    hypothesis_generator: HypothesisGenerator | None = None,
+    research_context_name: str | None = None,
 ) -> list[SelectedFactor]:
     filtered_panel = _filter_universe(panel, config.universe_symbols)
-    evaluator = _build_evaluator(config)
-    pool_evaluator = _build_pool_evaluator(config)
-    generator = GPGenerator(_build_pool_gp_config(config))
+    research_evaluator = _build_research_evaluator(config)
+    generator = hypothesis_generator or GPGenerator(_build_pool_gp_config(config))
+    telemetry_enabled = all(
+        callable(getattr(generator, method, None))
+        for method in ("record_stage_event", "telemetry_frames", "stage_events_frame")
+    )
     resolved_pool_limit = pool_limit or max(
         config.deep_eval_keep * 4,
         config.fast_filter_keep * 3,
@@ -242,26 +244,32 @@ def build_candidate_factor_pool(
         return _build_walk_forward_candidate_pool(
             filtered_panel,
             config,
-            pool_evaluator,
+            research_evaluator,
             generator,
             pool_limit=resolved_pool_limit,
             fast_keep=resolved_fast_keep,
             deep_keep=resolved_deep_keep,
         )
 
-    generator.evolve(filtered_panel, pool_evaluator, deduplicate=config.deduplicate_expressions)
-    candidates = generator.archive_candidates()
+    candidates = generator.generate(
+        filtered_panel,
+        research_evaluator,
+        deduplicate=config.deduplicate_expressions,
+    )
     deep_results = _deep_evaluate_population(
         candidates=candidates,
         panel=scoring_target if scoring_target is not None else filtered_panel,
-        evaluator=pool_evaluator,
+        evaluator=research_evaluator,
         keep=resolved_deep_keep,
         fast_keep=resolved_fast_keep,
         split_label=scoring_split if scoring_target is not None else None,
-        telemetry_generator=generator,
+        context_name=research_context_name or scoring_split,
+        telemetry_generator=generator if telemetry_enabled else None,
     )
     result = _results_to_factor_pool(deep_results, resolved_pool_limit)
-    if telemetry_callback is not None:
+    if scoring_target is not None:
+        result = [_with_window_pass(factor, previous=None) for factor in result]
+    if telemetry_callback is not None and telemetry_enabled:
         source_by_expression = {candidate.node.describe(): candidate for candidate in candidates}
         retained = {factor.expression for factor in result}
         for node, _ in deep_results:
@@ -273,7 +281,7 @@ def build_candidate_factor_pool(
                     status="passed" if node.describe() in retained else "rejected",
                     reject_reason="" if node.describe() in retained else "new_pool_limit_or_diversity",
                 )
-    if telemetry_callback is not None:
+    if telemetry_callback is not None and telemetry_enabled:
         telemetry_callback(generator)
     return result
 
@@ -337,7 +345,7 @@ def rescore_candidate_pool(
                 expression=factor.expression,
                 node=factor.node,
                 direction=factor.direction,
-                fitness=compute_factor_fitness(factor.metrics, factor.complexity, fitness_config),
+                fitness=compute_research_fitness(factor.metrics, factor.complexity, fitness_config),
                 metrics=dict(factor.metrics),
                 complexity=factor.complexity,
                 finite_ratio=factor.finite_ratio,
@@ -527,11 +535,10 @@ def run_alpha_mining_backtest(
 def _run_single_pass_alpha_mining(
     panel: pd.DataFrame,
     config: AlphaMiningConfig,
-    evaluator: FactorEvaluator,
-    generator: GPGenerator,
+    evaluator: FactorResearchEvaluator,
+    generator: HypothesisGenerator,
 ) -> list[SelectedFactor]:
-    generator.evolve(panel, evaluator, deduplicate=config.deduplicate_expressions)
-    population = generator.archive_candidates()
+    population = generator.generate(panel, evaluator, deduplicate=config.deduplicate_expressions)
     deep_results = _deep_evaluate_population(
         candidates=population,
         panel=panel,
@@ -550,8 +557,8 @@ def _run_single_pass_alpha_mining(
 def _run_walk_forward_alpha_mining(
     panel: pd.DataFrame,
     config: AlphaMiningConfig,
-    evaluator: FactorEvaluator,
-    generator: GPGenerator,
+    evaluator: FactorResearchEvaluator,
+    generator: HypothesisGenerator,
 ) -> list[SelectedFactor]:
     folds = _build_walk_forward_folds(
         panel,
@@ -569,8 +576,8 @@ def _run_walk_forward_alpha_mining(
         full_fold_panel = fold["full_panel"]
         split_map = fold["split_map"]
 
-        generator.evolve(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
-        candidates = [candidate for candidate in generator.archive_candidates() if candidate.evaluation.fitness > VERY_BAD_FITNESS]
+        generated = generator.generate(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
+        candidates = [candidate for candidate in generated if candidate.evaluation.fitness > VERY_BAD_FITNESS]
         candidates = candidates[: config.fast_filter_keep]
 
         fold_results: list[tuple[Any, EvaluationResult]] = []
@@ -617,8 +624,8 @@ def _run_walk_forward_alpha_mining(
 def _build_walk_forward_candidate_pool(
     panel: pd.DataFrame,
     config: AlphaMiningConfig,
-    evaluator: FactorEvaluator,
-    generator: GPGenerator,
+    evaluator: FactorResearchEvaluator,
+    generator: HypothesisGenerator,
     pool_limit: int,
     fast_keep: int,
     deep_keep: int,
@@ -656,6 +663,7 @@ def _build_walk_forward_candidate_pool(
             pool_limit=pool_limit,
             fast_keep=fast_keep,
             deep_keep=deep_keep,
+            hypothesis_generator=generator,
         )
 
     aggregated: dict[str, dict[str, Any]] = {}
@@ -664,8 +672,8 @@ def _build_walk_forward_candidate_pool(
         full_fold_panel = fold["full_panel"]
         split_map = fold["split_map"]
 
-        generator.evolve(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
-        candidates = [candidate for candidate in generator.archive_candidates() if candidate.evaluation.fitness > VERY_BAD_FITNESS]
+        generated = generator.generate(train_panel, evaluator, deduplicate=config.deduplicate_expressions)
+        candidates = [candidate for candidate in generated if candidate.evaluation.fitness > VERY_BAD_FITNESS]
         candidates = candidates[:fast_keep]
 
         fold_results: list[tuple[Any, EvaluationResult]] = []
@@ -689,13 +697,14 @@ def _build_walk_forward_candidate_pool(
 
 
 def _deep_evaluate_population(
-    candidates: list[GPCandidate],
+    candidates: list[HypothesisCandidate],
     panel: pd.DataFrame,
-    evaluator: FactorEvaluator,
+    evaluator: FactorResearchEvaluator,
     keep: int,
     fast_keep: int,
     split_label: str | None = None,
-    telemetry_generator: GPGenerator | None = None,
+    context_name: str = "research",
+    telemetry_generator: Any | None = None,
 ) -> list[tuple[Any, EvaluationResult]]:
     prepared = evaluator.prepare_panel(panel)
     viable_candidates = [candidate for candidate in candidates if candidate.evaluation.fitness > VERY_BAD_FITNESS]
@@ -710,14 +719,16 @@ def _deep_evaluate_population(
                 reject_reason="" if index < fast_keep else "fast_keep_limit",
             )
 
-    deep_results: list[tuple[GPCandidate, EvaluationResult]] = []
+    deep_results: list[tuple[HypothesisCandidate, EvaluationResult]] = []
     split_map = _single_split_map(prepared["date"], split_label) if split_label else None
+    context = evaluator.create_context(
+        prepared,
+        name=context_name,
+        split_map=split_map,
+        split_label=split_label or "validation",
+    )
     for candidate in deep_candidates:
-        evaluation = (
-            evaluator.evaluate_with_splits(candidate.node, prepared, split_map)
-            if split_map is not None
-            else evaluator.evaluate(candidate.node, prepared)
-        )
+        evaluation = evaluator.evaluate_context(candidate.node, context, mode="research")
         if telemetry_generator is not None:
             telemetry_generator.record_stage_event(candidate, stage="deep_evaluation", status="passed")
         if evaluation.fitness <= VERY_BAD_FITNESS:
@@ -797,6 +808,21 @@ def _results_to_factor_pool(
     return _build_diverse_candidate_pool(ranked_candidates, limit)
 
 
+def _with_window_pass(factor: SelectedFactor, previous: SelectedFactor | None) -> SelectedFactor:
+    metrics = dict(factor.metrics)
+    metrics["window_pass_count"] = 1 if previous is None else int(previous.metrics.get("window_pass_count", 0)) + 1
+    return SelectedFactor(
+        expression=factor.expression,
+        node=factor.node,
+        direction=factor.direction,
+        fitness=factor.fitness,
+        metrics=metrics,
+        complexity=factor.complexity,
+        finite_ratio=factor.finite_ratio,
+        values=factor.values,
+    )
+
+
 def _factor_evaluator_kwargs(config: AlphaMiningConfig) -> dict[str, Any]:
     return {
         "transaction_cost_bps": config.evaluation.transaction_cost_bps,
@@ -841,111 +867,20 @@ def _build_evaluator(
     )
 
 
+def _build_research_evaluator(config: AlphaMiningConfig) -> FactorResearchEvaluator:
+    return FactorResearchEvaluator(
+        trading_convention=DEFAULT_TRADING_CONVENTION,
+        min_finite_ratio=config.evaluation.min_finite_ratio,
+        min_std=config.evaluation.min_std,
+        min_abs_rank_ic=config.evaluation.min_abs_rank_ic,
+        max_signal_turnover=config.evaluation.max_turnover,
+        fitness_config=config.fitness,
+    )
+
+
 def _build_pool_gp_config(config: AlphaMiningConfig):
     """Use the configured compute-profile GP budget without hidden expansion."""
     return config.gp
-
-
-def _build_relaxed_pool_config(config: AlphaMiningConfig) -> AlphaMiningConfig:
-    relaxed_evaluation = config.evaluation.__class__(
-        transaction_cost_bps=config.evaluation.transaction_cost_bps,
-        slippage_bps=config.evaluation.slippage_bps,
-        long_quantile=config.evaluation.long_quantile,
-        short_quantile=config.evaluation.short_quantile,
-        min_finite_ratio=min(config.evaluation.min_finite_ratio, 0.45),
-        min_std=config.evaluation.min_std,
-        min_abs_rank_ic=min(config.evaluation.min_abs_rank_ic, 0.001),
-        max_turnover=max(config.evaluation.max_turnover, 3.0),
-        max_allowed_drawdown=max(config.evaluation.max_allowed_drawdown, 0.30),
-        ic_sign_tolerance=config.evaluation.ic_sign_tolerance,
-        annualization=config.evaluation.annualization,
-    )
-    relaxed_portfolio = config.portfolio.__class__(
-        selected_factor_count=config.portfolio.selected_factor_count,
-        min_selected_factor_count=config.portfolio.min_selected_factor_count,
-        max_pairwise_correlation=config.portfolio.max_pairwise_correlation,
-        factor_weight_scheme=config.portfolio.factor_weight_scheme,
-        weighting_scheme=config.portfolio.weighting_scheme,
-        position_limit=max(config.portfolio.position_limit, 0.08),
-        turnover_limit=max(config.portfolio.turnover_limit, 1.2),
-        gross_leverage=max(config.portfolio.gross_leverage, 0.8),
-        signal_vol_window=config.portfolio.signal_vol_window,
-        signal_clip=max(config.portfolio.signal_clip, 3.0),
-        smoothing=max(config.portfolio.smoothing, 0.6),
-        market_neutral=config.portfolio.market_neutral,
-        benchmark_follow_enabled=config.portfolio.benchmark_follow_enabled,
-        benchmark_follow_btc_symbol=config.portfolio.benchmark_follow_btc_symbol,
-        benchmark_follow_btc_weight=config.portfolio.benchmark_follow_btc_weight,
-        regime_benchmark_blend=dict(config.portfolio.regime_benchmark_blend),
-        regime_benchmark_direction=dict(config.portfolio.regime_benchmark_direction),
-    )
-    return AlphaMiningConfig(
-        gp=config.gp,
-        evaluation=relaxed_evaluation,
-        fitness=config.fitness,
-        regime=config.regime,
-        portfolio=relaxed_portfolio,
-        registry=config.registry,
-        live_mode=config.live_mode,
-        fast_filter_keep=config.fast_filter_keep,
-        deep_eval_keep=config.deep_eval_keep,
-        walk_forward_enabled=False,
-        walk_forward_train_fraction=config.walk_forward_train_fraction,
-        walk_forward_validation_fraction=config.walk_forward_validation_fraction,
-        walk_forward_backtest_fraction=config.walk_forward_backtest_fraction,
-        walk_forward_min_folds=config.walk_forward_min_folds,
-        deduplicate_expressions=config.deduplicate_expressions,
-        save_registry=False,
-        universe_symbols=config.universe_symbols,
-        compute_profile=config.compute_profile,
-    )
-
-
-def _build_pool_evaluator(config: AlphaMiningConfig) -> FactorEvaluator:
-    relaxed_config = _build_relaxed_pool_config(config)
-    return _build_evaluator(
-        relaxed_config,
-        reject_non_profitable=False,
-        reject_unstable_return_path=False,
-    )
-
-
-def _fallback_expand_candidate_pool(
-    candidates: list[GPCandidate],
-    existing_results: list[tuple[Any, EvaluationResult]],
-    panel: pd.DataFrame,
-    config: AlphaMiningConfig,
-    target_size: int,
-    split_label: str | None,
-    telemetry_generator: GPGenerator | None = None,
-) -> list[tuple[Any, EvaluationResult]]:
-    seen_expressions = {node.describe() for node, _ in existing_results}
-    relaxed_evaluator = _build_pool_evaluator(config)
-    expanded: list[tuple[Any, EvaluationResult]] = []
-    split_map = _split_dates(panel["date"]) if split_label is None else {
-        pd.Timestamp(date): split_label for date in pd.to_datetime(panel["date"], utc=False)
-    }
-    for candidate in candidates:
-        expression = candidate.node.describe()
-        if expression in seen_expressions:
-            continue
-        evaluation = relaxed_evaluator.evaluate_with_splits(candidate.node, prepared, split_map)
-        if evaluation.fitness <= VERY_BAD_FITNESS:
-            if telemetry_generator is not None:
-                telemetry_generator.record_stage_event(
-                    candidate,
-                    stage="fallback_expansion",
-                    status="rejected",
-                    reject_reason=str(evaluation.metrics.get("reject_reason", "very_bad_fitness")),
-                )
-            continue
-        if telemetry_generator is not None:
-            telemetry_generator.record_stage_event(candidate, stage="fallback_expansion", status="passed")
-        expanded.append((candidate.node, evaluation))
-        seen_expressions.add(expression)
-        if len(existing_results) + len(expanded) >= target_size:
-            break
-    return expanded
 
 
 def _select_diversified_factors(

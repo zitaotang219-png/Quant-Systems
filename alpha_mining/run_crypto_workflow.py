@@ -28,7 +28,7 @@ from alpha_mining import (
     select_factors_from_pool,
 )
 from alpha_mining.config import COMPUTE_PROFILES, get_compute_profile
-from alpha_mining.pipeline import _build_pool_evaluator, _single_split_map
+from alpha_mining.pipeline import _build_research_evaluator, _single_split_map
 from alpha_mining.search_funnel import build_search_funnel
 from alpha_mining.search_funnel import build_hypothesis_statistics
 from alpha_research.factor_diagnostics import generate_factor_diagnostics
@@ -386,8 +386,10 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         f"Pool size {rolling_workflow['rolling_summary']['final_pool_size']}, "
         f"selected {rolling_workflow['rolling_summary']['final_selected_factor_count']}",
     )
-    selected = refine_selected_factors_before_backtest(
-        selected=rolling_workflow["selected_factors"],
+    initial_selected = rolling_workflow["selected_factors"]
+    selected = finalize_factors_for_run(
+        research_only=args.research_only,
+        selected=initial_selected,
         validation_panel=validation_summary_panel,
         config=config,
         initial_capital=args.initial_capital,
@@ -396,7 +398,10 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         output_dir=output_dir,
         progress_callback=print_info,
     )
-    print_terminal_progress(5, total_steps, "Validation Refinement Complete", f"Retained {len(selected)} factors")
+    if not args.research_only:
+        print_terminal_progress(5, total_steps, "Portfolio Refinement Complete", f"Retained {len(selected)} factors")
+    else:
+        print_terminal_progress(5, total_steps, "Research Selection Complete", f"Selected {len(selected)} factors")
     generated_factor_count = sum(
         int(window.get("new_candidate_count", 0))
         for window in rolling_workflow["rolling_summary"].get("windows", [])
@@ -412,25 +417,25 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         if not candidate_audit.empty
         else {}
     )
-    initial_selected = rolling_workflow["selected_factors"]
     final_expressions = {factor.expression for factor in selected}
     refinement_events = []
-    for factor in initial_selected:
-        expression = factor.expression
-        common = {
-            "window": "final",
-            "individual_id": source_ids.get(expression, ""),
-            "expression": expression,
-            "expression_hash": hashlib.sha256(expression.encode("utf-8")).hexdigest(),
-            "generation": None,
-            "slot": None,
-        }
-        refinement_events.append({
-            **common,
-            "stage": "validation_refinement",
-            "status": "passed" if expression in final_expressions else "rejected",
-            "reject_reason": "" if expression in final_expressions else "refinement_rejected",
-        })
+    if not args.research_only:
+        for factor in initial_selected:
+            expression = factor.expression
+            common = {
+                "window": "final",
+                "individual_id": source_ids.get(expression, ""),
+                "expression": expression,
+                "expression_hash": hashlib.sha256(expression.encode("utf-8")).hexdigest(),
+                "generation": None,
+                "slot": None,
+            }
+            refinement_events.append({
+                **common,
+                "stage": "portfolio_refinement",
+                "status": "passed" if expression in final_expressions else "rejected",
+                "reject_reason": "" if expression in final_expressions else "portfolio_refinement_rejected",
+            })
     for factor in selected:
         expression = factor.expression
         refinement_events.append({
@@ -702,15 +707,40 @@ def build_phase3a_baseline_protocol(
             "purge_bars": ROLLING_POOL_PURGE_BARS,
             "embargo_bars": ROLLING_POOL_EMBARGO_BARS,
         },
-        "gp_configuration": to_jsonable(asdict(config.gp)),
-        "evaluation_configuration": {
+        "hypothesis_generator": {
+            "name": "vanilla_gp",
+            "configuration": to_jsonable(asdict(config.gp)),
+        },
+        "factor_research_configuration": {
             "trading_convention": DEFAULT_TRADING_CONVENTION.to_dict(),
-            "evaluator_thresholds": to_jsonable(asdict(config.evaluation)),
-            "fitness_configuration": to_jsonable(asdict(config.fitness)),
+            "metrics": [
+                "finite_coverage",
+                "non_degeneracy",
+                "validation_rank_ic",
+                "temporal_ic_stability",
+                "signal_turnover",
+                "expression_complexity",
+            ],
+            "evaluator_thresholds": {
+                "min_finite_ratio": config.evaluation.min_finite_ratio,
+                "min_std": config.evaluation.min_std,
+                "min_abs_rank_ic": config.evaluation.min_abs_rank_ic,
+                "max_signal_turnover": config.evaluation.max_turnover,
+            },
+            "fitness_configuration": {
+                "fast_rank_ic_weight": config.fitness.fast_rank_ic_weight,
+                "validation_ic_weight": config.fitness.validation_ic_weight,
+                "stability_weight": config.fitness.stability_weight,
+                "turnover_penalty": config.fitness.turnover_penalty,
+                "complexity_penalty": config.fitness.complexity_penalty,
+            },
+        },
+        "downstream_portfolio_configuration": {
             "transaction_cost_assumptions": {
                 "transaction_cost_bps": config.evaluation.transaction_cost_bps,
                 "slippage_bps": config.evaluation.slippage_bps,
             },
+            "portfolio": to_jsonable(asdict(config.portfolio)),
         },
         "reproducibility": {
             "git": manifest.payload["git"],
@@ -1082,14 +1112,16 @@ def revalidate_factor_pool(
     config: AlphaMiningConfig,
     fitness_config: FitnessConfig,
     event_callback: Any | None = None,
+    context_name: str = "rolling_validation",
 ) -> list[SelectedFactor]:
     if not candidate_pool or panel.empty:
         return []
-    evaluator = _build_pool_evaluator(config)
+    evaluator = _build_research_evaluator(config)
     split_map = _single_split_map(panel["date"], "validation")
+    context = evaluator.create_context(panel, name=context_name, split_map=split_map)
     validated: list[SelectedFactor] = []
     for factor in candidate_pool:
-        evaluation = evaluator.evaluate_with_splits(factor.node, panel, split_map)
+        evaluation = evaluator.evaluate_context(factor.node, context, mode="research")
         if evaluation.fitness <= -1_000_000_000.0:
             if event_callback is not None:
                 event_callback(factor, "rejected", str(evaluation.metrics.get("reject_reason", "very_bad_fitness")))
@@ -1116,6 +1148,56 @@ def revalidate_factor_pool(
     rescored = rescore_candidate_pool(validated, fitness_config)
     rescored.sort(key=lambda item: item.fitness, reverse=True)
     return rescored
+
+
+def validate_rolling_window_pool(
+    *,
+    previous_pool: list[SelectedFactor],
+    new_pool: list[SelectedFactor],
+    validation_panel: pd.DataFrame,
+    config: AlphaMiningConfig,
+    fitness_config: FitnessConfig,
+    context_name: str,
+    carried_event_callback: Any | None = None,
+    reused_event_callback: Any | None = None,
+) -> list[SelectedFactor]:
+    """Reuse current-window results and evaluate only factors carried from prior windows."""
+    previous_by_expression = {factor.expression: factor for factor in previous_pool}
+    new_expressions = {factor.expression for factor in new_pool}
+    carried = [factor for factor in previous_pool if factor.expression not in new_expressions]
+    validated_carried = revalidate_factor_pool(
+        carried,
+        validation_panel,
+        config,
+        fitness_config,
+        event_callback=carried_event_callback,
+        context_name=context_name,
+    )
+
+    reused_new: list[SelectedFactor] = []
+    for factor in new_pool:
+        previous = previous_by_expression.get(factor.expression)
+        metrics = dict(factor.metrics)
+        previous_passes = int(previous.metrics.get("window_pass_count", 0)) if previous is not None else 0
+        if previous is not None and previous_passes > 0:
+            metrics = merge_numeric_metrics(dict(previous.metrics), metrics, previous_passes)
+        metrics["window_pass_count"] = previous_passes + 1
+        reused_new.append(SelectedFactor(
+            expression=factor.expression,
+            node=factor.node,
+            direction=factor.direction,
+            fitness=float(factor.fitness),
+            metrics=metrics,
+            complexity=factor.complexity,
+            finite_ratio=float(factor.finite_ratio),
+            values=factor.values,
+        ))
+        if reused_event_callback is not None:
+            reused_event_callback(factor, "passed", "")
+
+    combined = rescore_candidate_pool([*validated_carried, *reused_new], fitness_config)
+    combined.sort(key=lambda item: item.fitness, reverse=True)
+    return combined
 
 
 def merge_numeric_metrics(previous: dict[str, Any], current: dict[str, Any], previous_count: int) -> dict[str, Any]:
@@ -1270,8 +1352,27 @@ def run_rolling_pool_workflow(
             scoring_panel=validation_panel,
             scoring_split="validation",
             telemetry_callback=capture_telemetry,
+            research_context_name=f"{spec['name']}:validation",
         )
-        before_dedupe = [*pool, *new_pool]
+        validation_events: list[dict[str, Any]] = []
+        reuse_events: list[dict[str, Any]] = []
+        validated_pool = validate_rolling_window_pool(
+            previous_pool=pool,
+            new_pool=new_pool,
+            validation_panel=validation_panel,
+            config=window_config,
+            fitness_config=fitness,
+            context_name=f"{spec['name']}:validation",
+            carried_event_callback=lambda factor, status, reason: validation_events.append(
+                stage_event(factor, "rolling_revalidation", status, reason, spec["name"])
+            ),
+            reused_event_callback=lambda factor, status, reason: reuse_events.append(
+                stage_event(factor, "current_window_validation_reuse", status, reason, spec["name"])
+            ),
+        )
+        stage_event_rows.append(pd.DataFrame(validation_events))
+        stage_event_rows.append(pd.DataFrame(reuse_events))
+        before_dedupe = [*validated_pool]
         combined_pool = dedupe_factor_pool(before_dedupe)
         retained_after_dedupe = {id(factor) for factor in combined_pool}
         stage_event_rows.append(pd.DataFrame([
@@ -1284,18 +1385,7 @@ def run_rolling_pool_workflow(
             )
             for factor in before_dedupe
         ]))
-        validation_events: list[dict[str, Any]] = []
-        validated_pool = revalidate_factor_pool(
-            combined_pool,
-            validation_panel,
-            window_config,
-            fitness,
-            event_callback=lambda factor, status, reason: validation_events.append(
-                stage_event(factor, "rolling_revalidation", status, reason, spec["name"])
-            ),
-        )
-        stage_event_rows.append(pd.DataFrame(validation_events))
-        pool = trim_candidate_pool(validated_pool, get_compute_profile(config.compute_profile).validated_pool_limit)
+        pool = trim_candidate_pool(combined_pool, get_compute_profile(config.compute_profile).validated_pool_limit)
         retained_after_trim = {factor.expression for factor in pool}
         stage_event_rows.append(pd.DataFrame([
             stage_event(
@@ -1499,6 +1589,33 @@ def refine_selected_factors_before_backtest(
         drop_count = int((decisions_df["final_action"] == "drop").sum()) if not decisions_df.empty else 0
         progress_callback(f"refine | complete | flips {flip_count} | dropped {drop_count} | kept {len(kept)}")
     return kept
+
+
+def finalize_factors_for_run(
+    *,
+    research_only: bool,
+    selected: list[SelectedFactor],
+    validation_panel: pd.DataFrame,
+    config: Any,
+    initial_capital: float,
+    regime_source_panel: pd.DataFrame | None,
+    min_count: int,
+    output_dir: Path,
+    progress_callback: Any | None = None,
+) -> list[SelectedFactor]:
+    """Keep portfolio-driven direction/drop decisions outside research-only runs."""
+    if research_only:
+        return selected
+    return refine_selected_factors_before_backtest(
+        selected=selected,
+        validation_panel=validation_panel,
+        config=config,
+        initial_capital=initial_capital,
+        regime_source_panel=regime_source_panel,
+        min_count=min_count,
+        output_dir=output_dir,
+        progress_callback=progress_callback,
+    )
 
 
 def _clone_selected_factor_with_direction(factor: Any, direction: int) -> SelectedFactor:

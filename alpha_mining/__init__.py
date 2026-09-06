@@ -27,8 +27,11 @@ from .config import (
     RegimeConfig,
     SelectedFactor,
 )
-from .evaluator import EvaluationResult, FactorEvaluator, VERY_BAD_FITNESS
+from .evaluation_types import EvaluationResult, VERY_BAD_FITNESS
+from .evaluator import FactorEvaluator
 from .gp_generator import GPCandidate, GPGenerator
+from .hypothesis import HypothesisCandidate, HypothesisGenerator
+from .research_evaluator import FactorResearchEvaluator, WindowResearchContext
 from .pipeline import (
     AlphaMiningStrategy,
     backtest_selected_factors,
@@ -71,10 +74,14 @@ __all__ = [
     "correlation",
     "parse_expression",
     "FactorEvaluator",
+    "FactorResearchEvaluator",
+    "WindowResearchContext",
     "EvaluationResult",
     "VERY_BAD_FITNESS",
     "GPGenerator",
     "GPCandidate",
+    "HypothesisCandidate",
+    "HypothesisGenerator",
     "RegimeDetector",
     "FactorRegistry",
     "run_alpha_mining",

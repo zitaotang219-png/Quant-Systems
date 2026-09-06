@@ -14,13 +14,13 @@ STAGE_ORDER = (
     "fast_keep",
     "deep_evaluation",
     "deep_evaluation_pass",
-    "fallback_expansion",
     "new_candidate_pool",
+    "current_window_validation_reuse",
     "rolling_revalidation",
     "rolling_pool_trim",
     "final_candidate_pool",
     "initial_factor_selection",
-    "validation_refinement",
+    "portfolio_refinement",
     "final_research_selection",
 )
 
@@ -52,7 +52,7 @@ def build_search_funnel(events: pd.DataFrame) -> pd.DataFrame:
                 "reject_count": int(len(rejected)),
                 "unique_expression_count": int(len(hashes)),
                 "cumulative_unique_expression_count": int(len(seen_hashes)),
-                "evaluation_count": int(len(subset)) if stage in {"fast_filter", "deep_evaluation", "fallback_expansion"} else 0,
+                "evaluation_count": int(len(subset)) if stage in {"fast_filter", "deep_evaluation", "rolling_revalidation"} else 0,
                 "rejection_reasons": ";".join(sorted(reason for reason in reasons.unique() if reason)),
             })
     return pd.DataFrame(rows)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 from typing import Any, Callable
 
@@ -26,14 +25,11 @@ from .dsl import (
     ts_rank,
     zscore,
 )
-from .evaluator import FactorEvaluator, EvaluationResult, VERY_BAD_FITNESS
+from .evaluation_types import VERY_BAD_FITNESS
+from .hypothesis import HypothesisCandidate, HypothesisEvaluator
 
 
-@dataclass
-class GPCandidate:
-    node: FactorNode
-    evaluation: EvaluationResult
-    individual_id: str = ""
+GPCandidate = HypothesisCandidate
 
 
 class GPGenerator:
@@ -45,7 +41,18 @@ class GPGenerator:
         self.stage_events: list[dict[str, Any]] = []
         self._archive: dict[str, GPCandidate] = {}
 
-    def evolve(self, panel: pd.DataFrame, evaluator: FactorEvaluator, deduplicate: bool = True) -> list[GPCandidate]:
+    def generate(
+        self,
+        panel: pd.DataFrame,
+        evaluator: HypothesisEvaluator,
+        *,
+        deduplicate: bool = True,
+    ) -> list[HypothesisCandidate]:
+        """Generate unique hypotheses while keeping GP breeding internal."""
+        self.evolve(panel, evaluator, deduplicate=deduplicate)
+        return self.archive_candidates()
+
+    def evolve(self, panel: pd.DataFrame, evaluator: HypothesisEvaluator, deduplicate: bool = True) -> list[GPCandidate]:
         self._archive = {}
         prepare_panel = getattr(evaluator, "prepare_panel", None)
         if callable(prepare_panel):
@@ -232,7 +239,7 @@ class GPGenerator:
         population: list[FactorNode],
         individual_ids: list[str],
         panel: pd.DataFrame,
-        evaluator: FactorEvaluator,
+        evaluator: HypothesisEvaluator,
         deduplicate: bool = True,
     ) -> list[GPCandidate]:
         if not deduplicate:
