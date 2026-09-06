@@ -15,6 +15,7 @@ import pandas as pd
 from alpha_mining import (
     AlphaMiningConfig,
     EvaluationConfig,
+    FactorResearchEvaluator,
     FitnessConfig,
     FactorRegistry,
     GPConfig,
@@ -57,10 +58,6 @@ DEFAULT_OUTPUT_DIR = Path("reports") / "crypto_alpha_workflow"
 DEFAULT_INITIAL_CAPITAL = 100000.0
 ROLLING_POOL_PURGE_BARS = 1
 ROLLING_POOL_EMBARGO_BARS = 3
-ROLLING_POOL_LIMIT = 96
-ROLLING_WINDOW_POOL_LIMIT = 48
-ROLLING_WINDOW_DEEP_KEEP = 64
-ROLLING_WINDOW_FAST_KEEP = 96
 
 ROLLING_WINDOW_SPECS = [
     {
@@ -90,6 +87,129 @@ ROLLING_WINDOW_SPECS = [
 ]
 FINAL_BACKTEST_START = "2025-06-01"
 FINAL_BACKTEST_END = "2026-01-31"
+
+
+def resolve_rolling_window_specs(compute_profile: str) -> list[dict[str, str]]:
+    """Resolve profile scope without changing the rolling-window methodology."""
+    count = get_compute_profile(compute_profile).rolling_window_count
+    if count < 1 or count > len(ROLLING_WINDOW_SPECS):
+        raise ValueError(
+            f"Profile {compute_profile!r} requests {count} rolling windows; "
+            f"the frozen research design provides {len(ROLLING_WINDOW_SPECS)}."
+        )
+    return [dict(spec) for spec in ROLLING_WINDOW_SPECS[:count]]
+
+
+def resolved_compute_budget(
+    config: AlphaMiningConfig,
+    window_specs: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Return the complete, auditable search budget for one run."""
+    profile = get_compute_profile(config.compute_profile)
+    specs = window_specs or resolve_rolling_window_specs(profile.name)
+    raw_per_window = int(config.gp.population_size * (config.gp.generations + 1))
+    return {
+        "profile": profile.name,
+        "rolling_window_count": int(len(specs)),
+        "rolling_window_names": [str(spec["name"]) for spec in specs],
+        "population_size": int(config.gp.population_size),
+        "generations": int(config.gp.generations),
+        "raw_candidate_occurrence_cap_per_window": raw_per_window,
+        "raw_candidate_occurrence_cap_total": int(raw_per_window * len(specs)),
+        "fast_screen_keep_per_window": int(config.fast_filter_keep),
+        "factor_research_evaluation_cap_per_new_window_search": int(config.deep_eval_keep),
+        "carried_factor_revalidation_cap_per_window": int(profile.validated_pool_limit),
+        "total_factor_research_evaluation_cap": int(
+            config.deep_eval_keep * len(specs)
+            + profile.validated_pool_limit * max(len(specs) - 1, 0)
+        ),
+        "validated_pool_limit": int(profile.validated_pool_limit),
+        "selected_factor_cap": int(config.portfolio.selected_factor_count),
+        "minimum_selected_factor_count": int(config.portfolio.min_selected_factor_count),
+        "automatic_budget_expansion": False,
+    }
+
+
+def build_workflow_config_payload(
+    config: AlphaMiningConfig,
+    window_specs: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Build the exact configuration snapshot persisted by the manifest."""
+    payload = to_jsonable(asdict(config))
+    payload["resolved_compute_budget"] = resolved_compute_budget(config, window_specs)
+    payload["resolved_research_windows"] = window_specs
+    return payload
+
+
+def summarize_observed_compute_budget(
+    *,
+    config: AlphaMiningConfig,
+    window_specs: list[dict[str, str]],
+    stage_events: pd.DataFrame,
+    final_pool_size: int,
+    selected_factor_count: int,
+) -> dict[str, Any]:
+    """Summarize counts from audit events and fail loudly on any cap breach."""
+    resolved = resolved_compute_budget(config, window_specs)
+    rows: list[dict[str, Any]] = []
+    for window_index, spec in enumerate(window_specs):
+        window_name = str(spec["name"])
+        events = stage_events.loc[stage_events["window"].astype(str) == window_name]
+        raw = events.loc[events["stage"] == "raw_gp_population"]
+        fast = events.loc[events["stage"] == "fast_filter"]
+        fast_keep = events.loc[
+            (events["stage"] == "fast_keep") & (events["status"] == "passed")
+        ]
+        deep = events.loc[events["stage"] == "deep_evaluation"]
+        carried = events.loc[events["stage"] == "rolling_revalidation"]
+        observed = {
+            "window": window_name,
+            "raw_candidate_occurrences": int(len(raw)),
+            "unique_archived_candidates": int(raw["expression_hash"].astype(str).nunique()),
+            "fast_evaluation_count": int(len(fast)),
+            "fast_screen_keep_count": int(len(fast_keep)),
+            "factor_research_evaluation_count": int(len(deep)),
+            "carried_factor_revalidation_count": int(len(carried)),
+        }
+        if observed["raw_candidate_occurrences"] > resolved["raw_candidate_occurrence_cap_per_window"]:
+            raise RuntimeError(f"{window_name} exceeded the resolved raw-candidate budget: {observed}")
+        if observed["fast_screen_keep_count"] > resolved["fast_screen_keep_per_window"]:
+            raise RuntimeError(f"{window_name} exceeded the resolved fast-screen keep budget: {observed}")
+        if observed["factor_research_evaluation_count"] > resolved[
+            "factor_research_evaluation_cap_per_new_window_search"
+        ]:
+            raise RuntimeError(f"{window_name} exceeded the resolved research-evaluation budget: {observed}")
+        carried_cap = 0 if window_index == 0 else resolved["carried_factor_revalidation_cap_per_window"]
+        if observed["carried_factor_revalidation_count"] > carried_cap:
+            raise RuntimeError(f"{window_name} exceeded the carried-factor revalidation budget: {observed}")
+        rows.append(observed)
+    if final_pool_size > resolved["validated_pool_limit"]:
+        raise RuntimeError("Final factor pool exceeded the resolved profile limit.")
+    if selected_factor_count > resolved["selected_factor_cap"]:
+        raise RuntimeError("Final factor selection exceeded the resolved profile limit.")
+    return {
+        "profile": config.compute_profile,
+        "windows": rows,
+        "raw_candidate_occurrences": int(sum(row["raw_candidate_occurrences"] for row in rows)),
+        "unique_archived_window_candidates": int(sum(row["unique_archived_candidates"] for row in rows)),
+        "fast_evaluation_count": int(sum(row["fast_evaluation_count"] for row in rows)),
+        "factor_research_evaluation_count": int(
+            sum(row["factor_research_evaluation_count"] for row in rows)
+        ),
+        "carried_factor_revalidation_count": int(
+            sum(row["carried_factor_revalidation_count"] for row in rows)
+        ),
+        "total_factor_research_evaluation_count": int(
+            sum(
+                row["factor_research_evaluation_count"]
+                + row["carried_factor_revalidation_count"]
+                for row in rows
+            )
+        ),
+        "final_pool_size": int(final_pool_size),
+        "selected_factor_count": int(selected_factor_count),
+        "caps_respected": True,
+    }
 
 DEFAULT_CRYPTO30_UNIVERSE = [
     {"symbol": "BTCUSDT", "name": "Bitcoin", "coingecko_id": "bitcoin"},
@@ -199,12 +319,18 @@ def namespace_gp_telemetry(
     return scoped_generation, scoped_candidates, scoped_events
 
 
-def prepare_workflow_panels(panel: pd.DataFrame, *, research_only: bool) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+def prepare_workflow_panels(
+    panel: pd.DataFrame,
+    *,
+    research_only: bool,
+    window_specs: list[dict[str, str]] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """Avoid materializing the spent holdout during research-only GP work."""
+    specs = window_specs or ROLLING_WINDOW_SPECS
     research_panel = slice_panel_by_date(
         panel,
-        start=ROLLING_WINDOW_SPECS[0]["train_start"],
-        end=ROLLING_WINDOW_SPECS[-1]["validation_end"],
+        start=specs[0]["train_start"],
+        end=specs[-1]["validation_end"],
     )
     if research_panel.empty:
         raise ValueError("Resolved rolling workflow windows produced an empty research panel.")
@@ -221,9 +347,12 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
     warnings.filterwarnings("ignore", message="An input array is constant; the correlation coefficient is not defined.")
     args = parse_args()
     set_global_seed(args.seed)
+    profile_name = "smoke" if args.quick else args.compute_profile
+    window_specs = resolve_rolling_window_specs(profile_name)
     output_dir = create_experiment_directory(args.output_dir)
     ensure_dir(output_dir / "factors")
-    ensure_dir(output_dir / "backtest")
+    if not args.research_only:
+        ensure_dir(output_dir / "backtest")
     logs_dir = ensure_dir(output_dir / "logs")
     manifest = ExperimentManifest(
         output_dir,
@@ -237,10 +366,18 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
     print_terminal_progress(1, total_steps, "Loading Local Data", f"Output dir: {output_dir.resolve()}")
 
     universe = load_crypto_universe_from_args(args)
-    panel = load_or_build_crypto_panel(args)
-    btc_benchmark_df = load_or_build_btc_benchmark(args, panel)
-    equal_weight_benchmark_df = build_equal_weight_benchmark(panel, benchmark_name="crypto30_equal_weight")
-    market_cap_benchmark_df = load_or_build_market_cap_benchmark(args, panel, universe)
+    panel = load_or_build_crypto_panel(
+        args,
+        research_end=window_specs[-1]["validation_end"] if args.research_only else None,
+    )
+    if args.research_only:
+        btc_benchmark_df = pd.DataFrame()
+        equal_weight_benchmark_df = pd.DataFrame()
+        market_cap_benchmark_df = pd.DataFrame()
+    else:
+        btc_benchmark_df = load_or_build_btc_benchmark(args, panel)
+        equal_weight_benchmark_df = build_equal_weight_benchmark(panel, benchmark_name="crypto30_equal_weight")
+        market_cap_benchmark_df = load_or_build_market_cap_benchmark(args, panel, universe)
     manifest.set_dataset_metadata(build_dataset_metadata(panel))
     manifest.save()
     print_info(
@@ -259,9 +396,10 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         write_text(output_dir / "universe_audit.md", build_universe_audit(asset_master, point_in_time_universe))
     write_data_quality_report(data_quality_report, output_dir / "data_quality_report.json")
     liquidity_sensitivity.to_csv(output_dir / "liquidity_sensitivity.csv", index=False)
-    btc_benchmark_df.to_csv(output_dir / "btc_benchmark.csv", index=False)
-    equal_weight_benchmark_df.to_csv(output_dir / "equal_weight_benchmark.csv", index=False)
-    market_cap_benchmark_df.to_csv(output_dir / "market_cap_benchmark.csv", index=False)
+    if not args.research_only:
+        btc_benchmark_df.to_csv(output_dir / "btc_benchmark.csv", index=False)
+        equal_weight_benchmark_df.to_csv(output_dir / "equal_weight_benchmark.csv", index=False)
+        market_cap_benchmark_df.to_csv(output_dir / "market_cap_benchmark.csv", index=False)
     pd.DataFrame(universe).to_csv(output_dir / "universe.csv", index=False)
 
     fitness_override = load_fitness_override(args.fitness_config)
@@ -271,7 +409,7 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         panel=panel,
         fitness_override=fitness_override,
         quick=args.quick,
-        compute_profile="smoke" if args.quick else args.compute_profile,
+        compute_profile=profile_name,
         seed=args.seed,
     )
     config = config.__class__(
@@ -294,7 +432,8 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         universe_symbols=config.universe_symbols,
         compute_profile=config.compute_profile,
     )
-    config_payload = to_jsonable(asdict(config))
+    compute_budget = resolved_compute_budget(config, window_specs)
+    config_payload = build_workflow_config_payload(config, window_specs)
     write_json(output_dir / "workflow_config.json", config_payload)
     manifest.set_config(portable_config_snapshot(config_payload))
     ledger = ExperimentLedger(output_dir.parent)
@@ -304,7 +443,8 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         "config": portable_config_snapshot(config_payload),
         "dataset": build_dataset_metadata(panel),
         "universe": universe,
-        "research_windows": ROLLING_WINDOW_SPECS,
+        "research_windows": window_specs,
+        "resolved_compute_budget": compute_budget,
         "trading_convention": "signal_close_t_entry_open_t_plus_1_exit_close_t_plus_1",
         "cli": " ".join(sys.argv),
     }
@@ -327,16 +467,20 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
     manifest.save()
     print_terminal_progress(2, total_steps, "Preparing Splits And Config")
 
-    research_panel, final_backtest_panel = prepare_workflow_panels(panel, research_only=args.research_only)
+    research_panel, final_backtest_panel = prepare_workflow_panels(
+        panel,
+        research_only=args.research_only,
+        window_specs=window_specs,
+    )
     research_panel.to_csv(output_dir / "research_panel.csv", index=False)
     if final_backtest_panel is not None:
         final_backtest_panel.to_csv(output_dir / "backtest_panel.csv", index=False)
     train_summary_panel = pd.concat(
-        [slice_panel_by_date(research_panel, start=spec["train_start"], end=spec["train_end"]) for spec in ROLLING_WINDOW_SPECS],
+        [slice_panel_by_date(research_panel, start=spec["train_start"], end=spec["train_end"]) for spec in window_specs],
         ignore_index=True,
     ).drop_duplicates(subset=["date", "symbol"]).reset_index(drop=True)
     validation_summary_panel = pd.concat(
-        [slice_panel_by_date(research_panel, start=spec["validation_start"], end=spec["validation_end"]) for spec in ROLLING_WINDOW_SPECS],
+        [slice_panel_by_date(research_panel, start=spec["validation_start"], end=spec["validation_end"]) for spec in window_specs],
         ignore_index=True,
     ).drop_duplicates(subset=["date", "symbol"]).reset_index(drop=True)
 
@@ -344,7 +488,7 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
     validation_regime_frame = filter_regime_frame_by_dates(
         full_regime_frame,
         pd.concat(
-            [slice_panel_by_date(research_panel, start=spec["validation_start"], end=spec["validation_end"])["date"] for spec in ROLLING_WINDOW_SPECS],
+            [slice_panel_by_date(research_panel, start=spec["validation_start"], end=spec["validation_end"])["date"] for spec in window_specs],
             ignore_index=True,
         ),
     )
@@ -367,7 +511,14 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
     gp_research_dir = ensure_dir(output_dir / "gp_research")
     write_json(
         gp_research_dir / "baseline_protocol.json",
-        build_phase3a_baseline_protocol(args, config, research_panel, manifest, point_in_time_universe),
+        build_phase3a_baseline_protocol(
+            args,
+            config,
+            research_panel,
+            manifest,
+            point_in_time_universe,
+            window_specs=window_specs,
+        ),
     )
     print_terminal_progress(3, total_steps, "Building Regime Snapshots")
 
@@ -377,6 +528,7 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         output_dir=output_dir,
         purge_bars=ROLLING_POOL_PURGE_BARS,
         embargo_bars=ROLLING_POOL_EMBARGO_BARS,
+        window_specs=window_specs,
         progress_callback=print_info,
     )
     print_terminal_progress(
@@ -409,9 +561,25 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
     generation_statistics = rolling_workflow.get("gp_generation_statistics", pd.DataFrame())
     candidate_audit = rolling_workflow.get("gp_candidate_audit", pd.DataFrame())
     stage_events = rolling_workflow.get("gp_stage_events", pd.DataFrame())
+    research_instrumentation = rolling_workflow.get("research_evaluation_instrumentation", pd.DataFrame())
     generation_statistics.to_csv(gp_research_dir / "generation_statistics.csv", index=False)
     candidate_audit.to_csv(gp_research_dir / "candidate_audit.csv", index=False)
     stage_events.to_csv(gp_research_dir / "stage_events.csv", index=False)
+    research_instrumentation.to_csv(gp_research_dir / "research_evaluation_instrumentation.csv", index=False)
+    if not research_instrumentation.empty:
+        numeric = research_instrumentation.select_dtypes(include=[np.number])
+        instrumentation_summary = {
+            column: (
+                float(numeric[column].sum())
+                if column.endswith("_seconds")
+                else int(numeric[column].sum())
+            )
+            for column in numeric.columns
+        }
+        write_json(
+            gp_research_dir / "research_evaluation_instrumentation_summary.json",
+            instrumentation_summary,
+        )
     source_ids = (
         candidate_audit.drop_duplicates("expression", keep="first").set_index("expression")["individual_id"].to_dict()
         if not candidate_audit.empty
@@ -466,6 +634,16 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
     ]
     stage_events = pd.concat([stage_events, pd.DataFrame(final_pool_events)], ignore_index=True, sort=False)
     stage_events.to_csv(gp_research_dir / "stage_events.csv", index=False)
+    observed_compute_budget = summarize_observed_compute_budget(
+        config=config,
+        window_specs=window_specs,
+        stage_events=stage_events,
+        final_pool_size=len(rolling_workflow["candidate_pool"]),
+        selected_factor_count=len(selected),
+    )
+    rolling_workflow["rolling_summary"]["resolved_compute_budget"] = compute_budget
+    rolling_workflow["rolling_summary"]["observed_compute_budget"] = observed_compute_budget
+    write_json(gp_research_dir / "observed_compute_budget.json", observed_compute_budget)
     funnel = build_search_funnel(stage_events)
     funnel.to_csv(gp_research_dir / "search_funnel.csv", index=False)
     hypothesis_statistics = build_hypothesis_statistics(stage_events, len(selected))
@@ -492,6 +670,9 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
             build_phase3a_report(generation_statistics, funnel, hypothesis_statistics, holdout_untouched=True),
         )
         manifest.set_research_results(generated_factor_count=generated_factor_count, selected_factors=[factor.expression for factor in selected])
+        manifest.payload["research"]["resolved_compute_budget"] = compute_budget
+        manifest.payload["research"]["observed_compute_budget"] = observed_compute_budget
+        manifest.payload["research"]["final_holdout_materialized"] = False
         manifest.save(status="completed")
         ledger.complete(started, results={"selected_factors": [factor.expression for factor in selected], "artifacts": {"run_directory": str(output_dir.resolve()), "search_funnel": str((gp_research_dir / "search_funnel.csv").resolve())}})
         write_text(logs_dir / "workflow.log", "status=completed_research_only\n")
@@ -534,6 +715,7 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
                 train_panel=train_summary_panel,
                 validation_panel=validation_summary_panel,
                 backtest_panel=final_backtest_panel,
+                window_specs=window_specs,
             ),
         ),
     )
@@ -551,6 +733,7 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         train_panel=train_summary_panel,
         validation_panel=validation_summary_panel,
         backtest_panel=final_backtest_panel,
+        window_specs=window_specs,
     )
     workflow_summary = {
         "market": "crypto",
@@ -580,6 +763,9 @@ def _main_workflow(lifecycle: dict[str, Any]) -> None:
         generated_factor_count=generated_factor_count,
         selected_factors=[factor.expression for factor in selected],
     )
+    manifest.payload["research"]["resolved_compute_budget"] = compute_budget
+    manifest.payload["research"]["observed_compute_budget"] = observed_compute_budget
+    manifest.payload["research"]["final_holdout_materialized"] = True
     manifest.save(status="completed")
     ledger.complete(started, results={"selected_factors": [factor.expression for factor in selected], "artifacts": {"run_directory": str(output_dir.resolve()), "workflow_report": str(workflow_report_path.resolve()), "search_funnel": str((gp_research_dir / "search_funnel.csv").resolve())}})
     write_text(logs_dir / "workflow.log", "status=completed\n")
@@ -611,7 +797,11 @@ def main() -> None:
         raise
 
 
-def load_or_build_crypto_panel(args: argparse.Namespace) -> pd.DataFrame:
+def load_or_build_crypto_panel(
+    args: argparse.Namespace,
+    *,
+    research_end: str | None = None,
+) -> pd.DataFrame:
     if args.panel_csv:
         panel = load_crypto_panel_csv(args.panel_csv)
     elif args.panel_dir:
@@ -620,6 +810,8 @@ def load_or_build_crypto_panel(args: argparse.Namespace) -> pd.DataFrame:
         raise ValueError("Provide either --panel-csv or --panel-dir for the crypto workflow.")
     universe = {record["symbol"] for record in load_crypto_universe_from_args(args)}
     panel = panel.loc[panel["symbol"].astype(str).isin(universe)].copy()
+    if research_end is not None:
+        panel = restrict_panel_to_research_horizon(panel, research_end)
     if panel.empty:
         raise ValueError("No rows remain after applying the crypto universe filter.")
     point_in_time = prepare_point_in_time_crypto_panel(
@@ -636,6 +828,12 @@ def load_or_build_crypto_panel(args: argparse.Namespace) -> pd.DataFrame:
     featured.attrs["data_quality_report"] = point_in_time.data_quality.report
     featured.attrs["liquidity_sensitivity_records"] = point_in_time.liquidity_sensitivity.to_dict(orient="records")
     return featured
+
+
+def restrict_panel_to_research_horizon(panel: pd.DataFrame, research_end: str) -> pd.DataFrame:
+    """Remove post-research observations before PIT preparation and feature engineering."""
+    dates = pd.to_datetime(panel["date"], utc=False)
+    return panel.loc[dates <= pd.Timestamp(research_end)].copy()
 
 
 def workflow_input_paths(args: argparse.Namespace) -> list[str]:
@@ -682,7 +880,10 @@ def build_phase3a_baseline_protocol(
     research_panel: pd.DataFrame,
     manifest: ExperimentManifest,
     point_in_time_universe: pd.DataFrame,
+    *,
+    window_specs: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    specs = window_specs or resolve_rolling_window_specs(config.compute_profile)
     data_hash = hashlib.sha256(
         pd.util.hash_pandas_object(research_panel, index=True).values.tobytes()
     ).hexdigest()
@@ -692,8 +893,8 @@ def build_phase3a_baseline_protocol(
             "dataset_paths": [record["path"] for record in manifest.payload["data"]["inputs"]],
             "dataset_fingerprints": manifest.payload["data"]["inputs"],
             "research_data_hash": data_hash,
-            "research_start": ROLLING_WINDOW_SPECS[0]["train_start"],
-            "research_end": ROLLING_WINDOW_SPECS[-1]["validation_end"],
+            "research_start": specs[0]["train_start"],
+            "research_end": specs[-1]["validation_end"],
             "pit_universe_configuration": {
                 "asset_master_csv": args.asset_master_csv,
                 "minimum_historical_bars": args.minimum_historical_bars,
@@ -703,10 +904,11 @@ def build_phase3a_baseline_protocol(
             },
         },
         "validation_design": {
-            "rolling_windows": ROLLING_WINDOW_SPECS,
+            "rolling_windows": specs,
             "purge_bars": ROLLING_POOL_PURGE_BARS,
             "embargo_bars": ROLLING_POOL_EMBARGO_BARS,
         },
+        "resolved_compute_budget": resolved_compute_budget(config, specs),
         "hypothesis_generator": {
             "name": "vanilla_gp",
             "configuration": to_jsonable(asdict(config.gp)),
@@ -940,7 +1142,7 @@ def build_crypto_workflow_config(
         population_size=profile.population_size,
         generations=profile.generations,
         tournament_size=5,
-        elitism=8,
+        elitism=2,
         max_depth=5,
         init_max_depth=4,
         crossover_rate=0.45,
@@ -1113,10 +1315,11 @@ def revalidate_factor_pool(
     fitness_config: FitnessConfig,
     event_callback: Any | None = None,
     context_name: str = "rolling_validation",
+    research_evaluator: FactorResearchEvaluator | None = None,
 ) -> list[SelectedFactor]:
     if not candidate_pool or panel.empty:
         return []
-    evaluator = _build_research_evaluator(config)
+    evaluator = research_evaluator or _build_research_evaluator(config)
     split_map = _single_split_map(panel["date"], "validation")
     context = evaluator.create_context(panel, name=context_name, split_map=split_map)
     validated: list[SelectedFactor] = []
@@ -1128,23 +1331,7 @@ def revalidate_factor_pool(
             continue
         if event_callback is not None:
             event_callback(factor, "passed", "")
-        metrics = dict(evaluation.metrics)
-        previous_passes = int(factor.metrics.get("window_pass_count", 0))
-        if previous_passes > 0:
-            metrics = merge_numeric_metrics(dict(factor.metrics), metrics, previous_passes)
-        metrics["window_pass_count"] = previous_passes + 1
-        validated.append(
-            SelectedFactor(
-                expression=factor.expression,
-                node=factor.node,
-                direction=evaluation.direction,
-                fitness=float(evaluation.fitness),
-                metrics=metrics,
-                complexity=factor.complexity,
-                finite_ratio=float(evaluation.finite_ratio),
-                values=evaluation.values,
-            )
-        )
+        validated.append(_merge_validated_factor(factor, evaluation))
     rescored = rescore_candidate_pool(validated, fitness_config)
     rescored.sort(key=lambda item: item.fitness, reverse=True)
     return rescored
@@ -1160,18 +1347,46 @@ def validate_rolling_window_pool(
     context_name: str,
     carried_event_callback: Any | None = None,
     reused_event_callback: Any | None = None,
+    research_evaluator: FactorResearchEvaluator | None = None,
 ) -> list[SelectedFactor]:
     """Reuse current-window results and evaluate only factors carried from prior windows."""
     previous_by_expression = {factor.expression: factor for factor in previous_pool}
     new_expressions = {factor.expression for factor in new_pool}
     carried = [factor for factor in previous_pool if factor.expression not in new_expressions]
-    validated_carried = revalidate_factor_pool(
-        carried,
-        validation_panel,
-        config,
-        fitness_config,
-        event_callback=carried_event_callback,
-        context_name=context_name,
+    evaluator = research_evaluator or _build_research_evaluator(config)
+    cached_carried: list[SelectedFactor] = []
+    uncached_carried: list[SelectedFactor] = []
+    if carried:
+        split_map = _single_split_map(validation_panel["date"], "validation")
+        context = evaluator.create_context(validation_panel, name=context_name, split_map=split_map)
+        for factor in carried:
+            cached = evaluator.cached_evaluation(factor.node, context, mode="research")
+            if cached is None:
+                uncached_carried.append(factor)
+                continue
+            if cached.fitness <= -1_000_000_000.0:
+                if reused_event_callback is not None:
+                    reused_event_callback(
+                        factor,
+                        "rejected",
+                        str(cached.metrics.get("reject_reason", "very_bad_fitness")),
+                    )
+                continue
+            cached_carried.append(_merge_validated_factor(factor, cached))
+            if reused_event_callback is not None:
+                reused_event_callback(factor, "passed", "")
+    validated_carried = (
+        revalidate_factor_pool(
+            uncached_carried,
+            validation_panel,
+            config,
+            fitness_config,
+            event_callback=carried_event_callback,
+            context_name=context_name,
+            research_evaluator=evaluator,
+        )
+        if uncached_carried
+        else []
     )
 
     reused_new: list[SelectedFactor] = []
@@ -1195,9 +1410,27 @@ def validate_rolling_window_pool(
         if reused_event_callback is not None:
             reused_event_callback(factor, "passed", "")
 
-    combined = rescore_candidate_pool([*validated_carried, *reused_new], fitness_config)
+    combined = rescore_candidate_pool([*cached_carried, *validated_carried, *reused_new], fitness_config)
     combined.sort(key=lambda item: item.fitness, reverse=True)
     return combined
+
+
+def _merge_validated_factor(factor: SelectedFactor, evaluation: Any) -> SelectedFactor:
+    metrics = dict(evaluation.metrics)
+    previous_passes = int(factor.metrics.get("window_pass_count", 0))
+    if previous_passes > 0:
+        metrics = merge_numeric_metrics(dict(factor.metrics), metrics, previous_passes)
+    metrics["window_pass_count"] = previous_passes + 1
+    return SelectedFactor(
+        expression=factor.expression,
+        node=factor.node,
+        direction=evaluation.direction,
+        fitness=float(evaluation.fitness),
+        metrics=metrics,
+        complexity=factor.complexity,
+        finite_ratio=float(evaluation.finite_ratio),
+        values=evaluation.values,
+    )
 
 
 def merge_numeric_metrics(previous: dict[str, Any], current: dict[str, Any], previous_count: int) -> dict[str, Any]:
@@ -1234,14 +1467,6 @@ def trim_candidate_pool(candidate_pool: list[SelectedFactor], pool_limit: int) -
         seen_series.append(factor.values)
         if len(trimmed) >= pool_limit:
             break
-    if len(trimmed) < min(pool_limit, len(deduped)):
-        used = {factor.expression for factor in trimmed}
-        for factor in deduped:
-            if factor.expression in used:
-                continue
-            trimmed.append(factor)
-            if len(trimmed) >= pool_limit:
-                break
     return trimmed[:pool_limit]
 
 
@@ -1290,8 +1515,10 @@ def run_rolling_pool_workflow(
     output_dir: Path,
     purge_bars: int,
     embargo_bars: int,
+    window_specs: list[dict[str, str]] | None = None,
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
+    specs = window_specs or resolve_rolling_window_specs(config.compute_profile)
     fitness_profiles = build_window_fitness_profiles(config.fitness)
     rolling_dir = ensure_dir(output_dir / "rolling_pool")
     pool: list[SelectedFactor] = []
@@ -1299,6 +1526,7 @@ def run_rolling_pool_workflow(
     generation_rows: list[pd.DataFrame] = []
     candidate_rows: list[pd.DataFrame] = []
     stage_event_rows: list[pd.DataFrame] = []
+    instrumentation_rows: list[dict[str, Any]] = []
     source_individual_ids: dict[str, str] = {}
 
     def stage_event(
@@ -1321,8 +1549,8 @@ def run_rolling_pool_workflow(
             "reject_reason": reject_reason,
         }
 
-    total_windows = len(ROLLING_WINDOW_SPECS)
-    for window_index, spec in enumerate(ROLLING_WINDOW_SPECS, start=1):
+    total_windows = len(specs)
+    for window_index, spec in enumerate(specs, start=1):
         if progress_callback is not None:
             progress_callback(
                 f"rolling | window {window_index}/{total_windows} | "
@@ -1330,9 +1558,13 @@ def run_rolling_pool_workflow(
             )
         fitness = fitness_profiles[spec["fitness_profile"]]
         window_config = clone_config_with_fitness(config, fitness, save_registry=False)
+        window_evaluator = _build_research_evaluator(window_config)
         train_panel = slice_panel_by_date(panel, spec["train_start"], spec["train_end"])
         validation_panel = slice_panel_by_date(panel, spec["validation_start"], spec["validation_end"])
-        effective_train_panel = apply_purge_and_embargo(train_panel, validation_panel, purge_bars, embargo_bars)
+        effective_train_panel = window_evaluator.prepare_panel(
+            apply_purge_and_embargo(train_panel, validation_panel, purge_bars, embargo_bars)
+        )
+        validation_panel = window_evaluator.prepare_panel(validation_panel)
         def capture_telemetry(generator: Any, window_name: str = spec["name"]) -> None:
             generation, candidates = generator.telemetry_frames()
             events = generator.stage_events_frame()
@@ -1353,6 +1585,7 @@ def run_rolling_pool_workflow(
             scoring_split="validation",
             telemetry_callback=capture_telemetry,
             research_context_name=f"{spec['name']}:validation",
+            research_evaluator=window_evaluator,
         )
         validation_events: list[dict[str, Any]] = []
         reuse_events: list[dict[str, Any]] = []
@@ -1369,7 +1602,9 @@ def run_rolling_pool_workflow(
             reused_event_callback=lambda factor, status, reason: reuse_events.append(
                 stage_event(factor, "current_window_validation_reuse", status, reason, spec["name"])
             ),
+            research_evaluator=window_evaluator,
         )
+        instrumentation_rows.append({"window": spec["name"], **window_evaluator.instrumentation_snapshot()})
         stage_event_rows.append(pd.DataFrame(validation_events))
         stage_event_rows.append(pd.DataFrame(reuse_events))
         before_dedupe = [*validated_pool]
@@ -1443,19 +1678,21 @@ def run_rolling_pool_workflow(
     pd.DataFrame([factor.summary_row() for factor in final_pool]).to_csv(rolling_dir / "final_candidate_pool.csv", index=False)
     return {
         "candidate_pool": final_pool,
-        "selected_factors": selected[: min(len(selected), 30)],
+        "selected_factors": selected,
         "rolling_summary": {
+            "compute_profile": config.compute_profile,
             "window_count": int(len(window_rows)),
             "purge_bars": int(purge_bars),
             "embargo_bars": int(embargo_bars),
             "pool_limit": int(get_compute_profile(config.compute_profile).validated_pool_limit),
             "final_pool_size": int(len(final_pool)),
-            "final_selected_factor_count": int(len(selected[: min(len(selected), 30)])),
+            "final_selected_factor_count": int(len(selected)),
             "windows": window_rows,
         },
         "gp_generation_statistics": pd.concat(generation_rows, ignore_index=True) if generation_rows else pd.DataFrame(),
         "gp_candidate_audit": pd.concat(candidate_rows, ignore_index=True) if candidate_rows else pd.DataFrame(),
         "gp_stage_events": pd.concat(stage_event_rows, ignore_index=True) if stage_event_rows else pd.DataFrame(),
+        "research_evaluation_instrumentation": pd.DataFrame(instrumentation_rows),
     }
 
 
@@ -1907,7 +2144,9 @@ def workflow_split_summary(
     train_panel: pd.DataFrame,
     validation_panel: pd.DataFrame,
     backtest_panel: pd.DataFrame,
+    window_specs: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    specs = window_specs or ROLLING_WINDOW_SPECS
     return {
         "research": panel_window_summary(research_panel),
         "train": panel_window_summary(train_panel),
@@ -1919,7 +2158,7 @@ def workflow_split_summary(
                 "train": {"date_min": str(spec["train_start"]), "date_max": str(spec["train_end"])},
                 "validation": {"date_min": str(spec["validation_start"]), "date_max": str(spec["validation_end"])},
             }
-            for spec in ROLLING_WINDOW_SPECS
+            for spec in specs
         ],
     }
 

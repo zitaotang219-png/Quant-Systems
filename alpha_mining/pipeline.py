@@ -13,7 +13,7 @@ from backtest.portfolio_constraints import PortfolioConstraints
 from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
 from execution.cost_model import TransactionCostModel
 
-from .config import AlphaMiningConfig, SelectedFactor
+from .config import AlphaMiningConfig, SelectedFactor, get_compute_profile
 from .evaluation_types import EvaluationResult, VERY_BAD_FITNESS
 from .evaluator import FactorEvaluator, _prepare_panel
 from .gp_generator import GPGenerator
@@ -220,18 +220,19 @@ def build_candidate_factor_pool(
     telemetry_callback: Any | None = None,
     hypothesis_generator: HypothesisGenerator | None = None,
     research_context_name: str | None = None,
+    research_evaluator: FactorResearchEvaluator | None = None,
 ) -> list[SelectedFactor]:
     filtered_panel = _filter_universe(panel, config.universe_symbols)
-    research_evaluator = _build_research_evaluator(config)
+    evaluator = research_evaluator or _build_research_evaluator(config)
     generator = hypothesis_generator or GPGenerator(_build_pool_gp_config(config))
     telemetry_enabled = all(
         callable(getattr(generator, method, None))
         for method in ("record_stage_event", "telemetry_frames", "stage_events_frame")
     )
-    resolved_pool_limit = pool_limit or max(
-        config.deep_eval_keep * 4,
-        config.fast_filter_keep * 3,
-        config.portfolio.selected_factor_count * 12,
+    resolved_pool_limit = (
+        get_compute_profile(config.compute_profile).validated_pool_limit
+        if pool_limit is None
+        else int(pool_limit)
     )
     requested_fast_keep = config.fast_filter_keep if fast_keep is None else fast_keep
     requested_deep_keep = config.deep_eval_keep if deep_keep is None else deep_keep
@@ -244,7 +245,7 @@ def build_candidate_factor_pool(
         return _build_walk_forward_candidate_pool(
             filtered_panel,
             config,
-            research_evaluator,
+            evaluator,
             generator,
             pool_limit=resolved_pool_limit,
             fast_keep=resolved_fast_keep,
@@ -253,13 +254,13 @@ def build_candidate_factor_pool(
 
     candidates = generator.generate(
         filtered_panel,
-        research_evaluator,
+        evaluator,
         deduplicate=config.deduplicate_expressions,
     )
     deep_results = _deep_evaluate_population(
         candidates=candidates,
         panel=scoring_target if scoring_target is not None else filtered_panel,
-        evaluator=research_evaluator,
+        evaluator=evaluator,
         keep=resolved_deep_keep,
         fast_keep=resolved_fast_keep,
         split_label=scoring_split if scoring_target is not None else None,
@@ -415,9 +416,9 @@ def run_walk_forward_evaluation(
         candidate_pool = build_candidate_factor_pool(
             panel=fold["train_panel"],
             config=config,
-            pool_limit=max(config.portfolio.selected_factor_count * 10, config.deep_eval_keep * 4),
-            fast_keep=max(config.fast_filter_keep * 2, config.portfolio.selected_factor_count * 12),
-            deep_keep=max(config.deep_eval_keep * 4, config.portfolio.selected_factor_count * 12),
+            pool_limit=get_compute_profile(config.compute_profile).validated_pool_limit,
+            fast_keep=config.fast_filter_keep,
+            deep_keep=config.deep_eval_keep,
             scoring_panel=fold["validation_panel"],
             scoring_split="validation",
         )
@@ -568,7 +569,7 @@ def _run_walk_forward_alpha_mining(
         min_folds=config.walk_forward_min_folds,
     )
     if not folds:
-        return _run_single_pass_alpha_mining(panel, config, evaluator, generator)
+        return []
 
     aggregated: dict[str, dict[str, Any]] = {}
     for fold in folds:
@@ -600,7 +601,7 @@ def _run_walk_forward_alpha_mining(
             bucket["evaluations"].append(evaluation)
 
     if not aggregated:
-        return _run_single_pass_alpha_mining(panel, config, evaluator, generator)
+        return []
 
     combined_results: list[tuple[Any, EvaluationResult]] = []
     for payload in aggregated.values():
@@ -616,8 +617,6 @@ def _run_walk_forward_alpha_mining(
         config.portfolio.min_selected_factor_count,
         config.portfolio.max_pairwise_correlation,
     )
-    if not selected:
-        return _run_single_pass_alpha_mining(panel, config, evaluator, generator)
     return selected
 
 
@@ -638,33 +637,7 @@ def _build_walk_forward_candidate_pool(
         min_folds=config.walk_forward_min_folds,
     )
     if not folds:
-        return build_candidate_factor_pool(
-            panel=panel,
-            config=AlphaMiningConfig(
-                gp=config.gp,
-                evaluation=config.evaluation,
-                fitness=config.fitness,
-                regime=config.regime,
-                portfolio=config.portfolio,
-                registry=config.registry,
-                live_mode=config.live_mode,
-                fast_filter_keep=config.fast_filter_keep,
-                deep_eval_keep=config.deep_eval_keep,
-                walk_forward_enabled=False,
-                walk_forward_train_fraction=config.walk_forward_train_fraction,
-                walk_forward_validation_fraction=config.walk_forward_validation_fraction,
-                walk_forward_backtest_fraction=config.walk_forward_backtest_fraction,
-                walk_forward_min_folds=config.walk_forward_min_folds,
-                deduplicate_expressions=config.deduplicate_expressions,
-                save_registry=config.save_registry,
-                universe_symbols=config.universe_symbols,
-                compute_profile=config.compute_profile,
-            ),
-            pool_limit=pool_limit,
-            fast_keep=fast_keep,
-            deep_keep=deep_keep,
-            hypothesis_generator=generator,
-        )
+        return []
 
     aggregated: dict[str, dict[str, Any]] = {}
     for fold in folds:
@@ -889,8 +862,10 @@ def _select_diversified_factors(
     min_count: int,
     max_pairwise_correlation: float,
 ) -> list[SelectedFactor]:
+    # ``min_count`` is checked by the workflow after selection; it must never
+    # relax the fixed redundancy threshold in order to manufacture a result.
+    _ = min_count
     selected: list[SelectedFactor] = []
-    backup_candidates: list[SelectedFactor] = []
     selected_value_map: dict[str, pd.Series] = {}
     seen_expressions: set[str] = set()
 
@@ -908,7 +883,6 @@ def _select_diversified_factors(
             finite_ratio=evaluation.finite_ratio,
             values=evaluation.values,
         )
-        backup_candidates.append(candidate)
         if _is_too_correlated(evaluation.values, selected_value_map.values(), max_pairwise_correlation):
             continue
         selected.append(candidate)
@@ -916,7 +890,7 @@ def _select_diversified_factors(
         seen_expressions.add(expression)
         if len(selected) >= limit:
             break
-    return _fill_factor_shortfall(selected, backup_candidates, min_count, limit, max_pairwise_correlation)
+    return selected[:limit]
 
 
 def _select_diversified_factor_pool(
@@ -925,8 +899,8 @@ def _select_diversified_factor_pool(
     min_count: int,
     max_pairwise_correlation: float,
 ) -> list[SelectedFactor]:
+    _ = min_count
     selected: list[SelectedFactor] = []
-    backup_candidates: list[SelectedFactor] = []
     selected_value_map: dict[str, pd.Series] = {}
     seen_expressions: set[str] = set()
 
@@ -935,7 +909,6 @@ def _select_diversified_factor_pool(
             continue
         if factor.values is None:
             continue
-        backup_candidates.append(factor)
         if _is_too_correlated(factor.values, selected_value_map.values(), max_pairwise_correlation):
             continue
         selected.append(factor)
@@ -943,55 +916,6 @@ def _select_diversified_factor_pool(
         seen_expressions.add(factor.expression)
         if len(selected) >= limit:
             break
-    return _fill_factor_shortfall(selected, backup_candidates, min_count, limit, max_pairwise_correlation)
-
-
-def _fill_factor_shortfall(
-    selected: list[SelectedFactor],
-    ranked_candidates: list[SelectedFactor],
-    min_count: int,
-    limit: int,
-    max_pairwise_correlation: float,
-) -> list[SelectedFactor]:
-    if len(selected) >= min(min_count, limit):
-        return selected[:limit]
-
-    selected_expressions = {factor.expression for factor in selected}
-    selected_value_map = {
-        factor.expression: factor.values
-        for factor in selected
-        if factor.values is not None
-    }
-    staged_thresholds = [
-        max_pairwise_correlation,
-        min(max_pairwise_correlation + 0.05, 0.75),
-        min(max_pairwise_correlation + 0.10, 0.85),
-        min(max_pairwise_correlation + 0.15, 0.92),
-    ]
-
-    for threshold in staged_thresholds:
-        if len(selected) >= min(min_count, limit):
-            break
-        for factor in ranked_candidates:
-            if factor.expression in selected_expressions:
-                continue
-            if factor.values is not None and _is_too_correlated(factor.values, selected_value_map.values(), threshold):
-                continue
-            selected.append(factor)
-            selected_expressions.add(factor.expression)
-            if factor.values is not None:
-                selected_value_map[factor.expression] = factor.values
-            if len(selected) >= limit:
-                break
-
-    if len(selected) < min(min_count, limit):
-        for factor in ranked_candidates:
-            if factor.expression in selected_expressions:
-                continue
-            selected.append(factor)
-            selected_expressions.add(factor.expression)
-            if len(selected) >= limit:
-                break
     return selected[:limit]
 
 

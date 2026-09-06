@@ -35,3 +35,13 @@ def test_signal_values_do_not_use_future_prices(tmp_path) -> None:
     changed=panel.copy(); changed.loc[changed["date"]==pd.Timestamp("2024-01-06"),"close"]=999.0
     revised=generate_factor_diagnostics(factors=[_factor()],panel=changed,output_dir=tmp_path/"changed")["timeseries"]
     pdt.assert_series_equal(baseline["signal_value"],revised["signal_value"],check_names=False)
+
+
+def test_empty_selection_writes_clean_diagnostic_artifacts(tmp_path) -> None:
+    output_dir = tmp_path / "empty"
+    diagnostics = generate_factor_diagnostics(factors=[], panel=_panel(), output_dir=output_dir)
+    assert all(frame.empty for frame in diagnostics.values())
+    assert (output_dir / "factor_statistics.csv").exists()
+    report = (output_dir / "alpha_validation_report.md").read_text(encoding="utf-8")
+    assert "No factors were selected" in report
+    assert "budget was not expanded" in report

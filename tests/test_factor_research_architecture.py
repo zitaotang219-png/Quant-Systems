@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import pandas.testing as pdt
 
 from alpha_mining.config import AlphaMiningConfig, FitnessConfig, SelectedFactor
 from alpha_mining.dsl import field, rank
@@ -11,6 +13,10 @@ from alpha_mining.hypothesis import HypothesisCandidate
 from alpha_mining.pipeline import build_candidate_factor_pool
 from alpha_mining.research_evaluator import (
     FactorResearchEvaluator,
+    _daily_cross_sectional_rank_ic,
+    _daily_cross_sectional_rank_ic_context,
+    _signal_turnover,
+    _signal_turnover_context,
     _temporal_ic_stability,
 )
 from alpha_mining.run_crypto_workflow import (
@@ -93,6 +99,97 @@ def test_ic_stability_uses_the_ic_series_through_time() -> None:
     assert unstable == 0.0
 
 
+def test_native_rolling_rank_preserves_average_percentile_semantics() -> None:
+    from alpha_mining.dsl import _rolling_percentile_rank
+
+    values = pd.Series([1.0, 2.0, 2.0, np.nan, 3.0, 1.0, 1.0, 4.0, 4.0])
+
+    def legacy_rank_last(window: pd.Series) -> float:
+        valid = window.dropna()
+        return np.nan if valid.empty else float(valid.rank(pct=True).iloc[-1])
+
+    expected = values.rolling(window=3, min_periods=3).apply(legacy_rank_last, raw=False)
+    actual = _rolling_percentile_rank(values, window=3)
+    pdt.assert_series_equal(actual, expected)
+
+
+def test_native_rolling_correlation_preserves_grouped_semantics() -> None:
+    from alpha_mining.dsl import _rolling_correlation
+
+    panel = _research_panel().sample(frac=1.0, random_state=17)
+    left = panel["signal"]
+    right = panel["other_signal"]
+    expected = pd.Series(np.nan, index=panel.index, dtype=float)
+    ordered = panel.sort_values(["symbol", "date"], kind="mergesort")
+    for _, group in ordered.groupby("symbol", sort=False):
+        expected.loc[group.index] = group["signal"].rolling(3, min_periods=3).corr(group["other_signal"])
+
+    actual = _rolling_correlation(panel, left, right, window=3)
+    pdt.assert_series_equal(actual, expected)
+
+
+def test_precomputed_rank_ic_and_turnover_match_reference_paths() -> None:
+    evaluator = FactorResearchEvaluator(min_abs_rank_ic=0.0)
+    panel = _research_panel()
+    split_map = {pd.Timestamp(date): "validation" for date in panel["date"].unique()}
+    context = evaluator.create_context(panel, name="equivalence:validation", split_map=split_map)
+    values = panel["signal"].astype(float).copy()
+    values.iloc[[1, 7]] = np.nan
+
+    reference_ic = _daily_cross_sectional_rank_ic(panel["date"], values, panel["future_return"])
+    optimized_ic = _daily_cross_sectional_rank_ic_context(context, values)
+    reference_ic = reference_ic.sort_values("date").reset_index(drop=True)
+    optimized_ic = optimized_ic.sort_values("date").reset_index(drop=True)
+    pdt.assert_frame_equal(optimized_ic, reference_ic, check_exact=False, atol=1e-12, rtol=1e-12)
+
+    reference_turnover = _signal_turnover(panel, values, split_map)
+    optimized_turnover = _signal_turnover_context(context, values)
+    assert optimized_turnover == reference_turnover
+
+
+def test_research_metrics_match_reference_components() -> None:
+    evaluator = FactorResearchEvaluator(min_abs_rank_ic=0.0, max_signal_turnover=99.0)
+    panel = _research_panel()
+    split_map = {pd.Timestamp(date): "validation" for date in panel["date"].unique()}
+    context = evaluator.create_context(panel, name="metric_equivalence:validation", split_map=split_map)
+    result = evaluator.evaluate_context(field("signal"), context, mode="research")
+
+    reference_ic = _daily_cross_sectional_rank_ic(panel["date"], panel["signal"], panel["future_return"])
+    raw_mean_ic = float(reference_ic["rank_ic"].mean())
+    direction = -1 if raw_mean_ic < 0.0 else 1
+    oriented_ic = reference_ic["rank_ic"] * direction
+    reference_turnover = _signal_turnover(panel, panel["signal"] * direction, split_map)
+
+    assert result.direction == direction
+    assert result.metrics["validation_rank_ic_mean"] == float(oriented_ic.mean())
+    assert result.metrics["temporal_ic_stability"] == _temporal_ic_stability(oriented_ic)
+    assert result.metrics["signal_turnover"] == reference_turnover
+    pdt.assert_series_equal(result.values, panel["signal"].astype(float) * direction)
+
+
+def test_instrumentation_records_value_and_result_reuse() -> None:
+    evaluator = FactorResearchEvaluator(min_abs_rank_ic=0.0, max_signal_turnover=99.0)
+    panel = _research_panel()
+    context = evaluator.create_context(panel, name="instrumentation:validation")
+    node = field("signal")
+
+    evaluator.evaluate_context(node, context, mode="fast")
+    evaluator.evaluate_context(node, context, mode="research")
+    evaluator.evaluate_context(node, context, mode="research")
+    stats = evaluator.instrumentation_snapshot()
+
+    assert stats["total_expression_evaluations"] == 3
+    assert stats["unique_expression_evaluations"] == 1
+    assert stats["fast_screen_evaluations"] == 1
+    assert stats["factor_research_evaluations"] == 1
+    assert stats["evaluation_cache_hits"] == 1
+    assert stats["value_cache_hits"] >= 1
+    assert stats["rank_ic_cache_hits"] == 1
+    assert stats["rank_ic_evaluations"] == 1
+    assert stats["avoided_duplicate_evaluations"] >= 2
+    assert stats["portfolio_simulation_calls"] == 0
+
+
 def test_candidate_search_does_not_invoke_portfolio_simulation(monkeypatch) -> None:
     def forbidden_portfolio_call(*args, **kwargs):
         raise AssertionError("candidate search invoked the portfolio simulator")
@@ -143,6 +240,34 @@ def test_current_window_candidates_are_reused_while_carried_factors_are_revalida
     assert set(by_expression) == {"signal", "rank(signal)", "other_signal"}
     assert by_expression["signal"].metrics["window_pass_count"] == 3
     assert by_expression["other_signal"].metrics["window_pass_count"] == 1
+
+
+def test_carried_factor_with_current_context_result_is_not_revalidated(monkeypatch) -> None:
+    panel = _research_panel()
+    evaluator = FactorResearchEvaluator(min_abs_rank_ic=0.0, max_signal_turnover=99.0)
+    context_name = "window_2:validation"
+    split_map = {pd.Timestamp(date): "validation" for date in panel["date"].unique()}
+    context = evaluator.create_context(panel, name=context_name, split_map=split_map)
+    node = rank(field("signal"))
+    evaluator.evaluate_context(node, context, mode="research")
+
+    def forbidden_revalidation(*args, **kwargs):
+        raise AssertionError("cached current-window factor was revalidated")
+
+    monkeypatch.setattr("alpha_mining.run_crypto_workflow.revalidate_factor_pool", forbidden_revalidation)
+    combined = validate_rolling_window_pool(
+        previous_pool=[_selected("rank(signal)", node, passes=2)],
+        new_pool=[],
+        validation_panel=panel,
+        config=AlphaMiningConfig(),
+        fitness_config=FitnessConfig(),
+        context_name=context_name,
+        research_evaluator=evaluator,
+    )
+
+    assert [factor.expression for factor in combined] == ["rank(signal)"]
+    assert combined[0].metrics["window_pass_count"] == 3
+    assert evaluator.instrumentation_snapshot()["factor_research_evaluations"] == 1
 
 
 def test_research_only_finalization_skips_strategy_refinement(monkeypatch, tmp_path: Path) -> None:

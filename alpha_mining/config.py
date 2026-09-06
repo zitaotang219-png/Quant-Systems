@@ -12,6 +12,7 @@ class ComputeProfile:
     """Search-budget limits only; every profile uses the same research process."""
 
     name: str
+    rolling_window_count: int
     population_size: int
     generations: int
     fast_filter_keep: int
@@ -22,9 +23,16 @@ class ComputeProfile:
 
 
 COMPUTE_PROFILES: dict[str, ComputeProfile] = {
-    "smoke": ComputeProfile("smoke", 12, 1, 12, 8, 12, 4, 3),
-    "research": ComputeProfile("research", 24, 2, 36, 16, 24, 6, 4),
-    "certified": ComputeProfile("certified", 60, 4, 96, 64, 48, 10, 8),
+    # SMOKE proves that the complete research-only pipeline is operational. It
+    # deliberately carries no minimum-result requirement: an empty discovery
+    # set is a valid integration-test outcome, not a reason to expand search.
+    "smoke": ComputeProfile("smoke", 1, 8, 1, 6, 3, 4, 2, 0),
+    # RESEARCH is the Phase 3A evidence run and therefore retains all rolling
+    # windows while keeping deep research evaluation deliberately scarce.
+    "research": ComputeProfile("research", 3, 12, 1, 8, 4, 8, 4, 3),
+    # CERTIFIED is reserved for a later frozen run; it is never an automatic
+    # fallback for either of the smaller profiles.
+    "certified": ComputeProfile("certified", 3, 24, 2, 16, 8, 16, 6, 4),
 }
 
 

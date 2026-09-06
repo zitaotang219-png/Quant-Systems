@@ -9,7 +9,13 @@ from alpha_mining.config import AlphaMiningConfig, GPConfig, PortfolioConfig, Se
 from alpha_mining.evaluator import EvaluationResult
 from alpha_mining.gp_generator import GPGenerator
 from alpha_mining.pipeline import select_factors_from_pool
-from alpha_mining.run_crypto_workflow import main, namespace_gp_telemetry, prepare_workflow_panels
+from alpha_mining.run_crypto_workflow import (
+    main,
+    namespace_gp_telemetry,
+    prepare_workflow_panels,
+    resolve_rolling_window_specs,
+    restrict_panel_to_research_horizon,
+)
 from alpha_mining.search_funnel import STAGE_ORDER, build_hypothesis_statistics, build_search_funnel
 from alpha_mining.dsl import rank
 from utils.experiment_ledger import ExperimentLedger
@@ -172,6 +178,31 @@ def test_research_only_panel_preparation_does_not_materialize_final_holdout(monk
     _, final_panel = prepare_workflow_panels(panel, research_only=True)
     assert final_panel is None
     assert ("2025-06-01", "2026-01-31") not in calls
+
+
+def test_smoke_research_panel_stops_after_its_single_validation_window() -> None:
+    panel = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01", "2024-08-31", "2024-09-01", "2025-06-01"]),
+        "symbol": ["AAA"] * 4,
+        "close": [1.0] * 4,
+    })
+    research, final_panel = prepare_workflow_panels(
+        panel,
+        research_only=True,
+        window_specs=resolve_rolling_window_specs("smoke"),
+    )
+    assert final_panel is None
+    assert research["date"].max() == pd.Timestamp("2024-08-31")
+
+
+def test_research_horizon_is_applied_before_workflow_feature_preparation() -> None:
+    panel = pd.DataFrame({
+        "date": ["2024-08-31", "2024-09-01", "2025-06-01"],
+        "symbol": ["AAA"] * 3,
+        "close": [1.0, 2.0, 3.0],
+    })
+    restricted = restrict_panel_to_research_horizon(panel, "2024-08-31")
+    assert restricted["close"].tolist() == [1.0]
 
 
 def test_main_wrapper_persists_normal_exception_path(monkeypatch, tmp_path) -> None:

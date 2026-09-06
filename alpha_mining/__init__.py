@@ -31,7 +31,7 @@ from .evaluation_types import EvaluationResult, VERY_BAD_FITNESS
 from .evaluator import FactorEvaluator
 from .gp_generator import GPCandidate, GPGenerator
 from .hypothesis import HypothesisCandidate, HypothesisGenerator
-from .research_evaluator import FactorResearchEvaluator, WindowResearchContext
+from .research_evaluator import FactorResearchEvaluator, ResearchEvaluationInstrumentation, WindowResearchContext
 from .pipeline import (
     AlphaMiningStrategy,
     backtest_selected_factors,
@@ -75,6 +75,7 @@ __all__ = [
     "parse_expression",
     "FactorEvaluator",
     "FactorResearchEvaluator",
+    "ResearchEvaluationInstrumentation",
     "WindowResearchContext",
     "EvaluationResult",
     "VERY_BAD_FITNESS",

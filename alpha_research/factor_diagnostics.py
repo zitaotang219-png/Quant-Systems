@@ -25,6 +25,26 @@ def generate_factor_diagnostics(
     """Write reliability diagnostics without changing factor selection or trading."""
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
+    if not factors:
+        outputs = _empty_diagnostics()
+        for name, filename in (
+            ("timeseries", "factor_timeseries.csv"),
+            ("statistics", "factor_statistics.csv"),
+            ("decay", "factor_decay.csv"),
+            ("quantile_returns", "factor_quantile_returns.csv"),
+            ("similarity", "factor_similarity_matrix.csv"),
+            ("clusters", "factor_clusters.csv"),
+            ("families", "factor_family_summary.csv"),
+            ("stability", "factor_window_stability.csv"),
+        ):
+            outputs[name].to_csv(root / filename, index=False)
+        (root / "alpha_validation_report.md").write_text(
+            "# Alpha Validation Report\n\n"
+            "No factors were selected. The configured research budget was not expanded; "
+            "diagnostic artifacts are intentionally empty.\n",
+            encoding="utf-8",
+        )
+        return outputs
     frame = panel.sort_values(["symbol", "date"], kind="mergesort").reset_index(drop=True).copy()
     frame["date"] = pd.to_datetime(frame["date"], utc=False)
     frame["forward_return"] = trading_convention.forward_return(frame)
@@ -46,6 +66,32 @@ def generate_factor_diagnostics(
     stability.to_csv(root / "factor_window_stability.csv", index=False)
     (root / "alpha_validation_report.md").write_text(_report(statistics, decay, similarity, families, stability), encoding="utf-8")
     return {"timeseries": timeseries, "statistics": statistics, "decay": decay, "quantile_returns": quantile_returns, "similarity": similarity, "clusters": clusters, "families": families, "stability": stability}
+
+
+def _empty_diagnostics() -> dict[str, pd.DataFrame]:
+    """Stable empty schemas for a valid zero-discovery SMOKE outcome."""
+    return {
+        "timeseries": pd.DataFrame(columns=["date", "symbol", "forward_return", "factor", "signal_value"]),
+        "statistics": pd.DataFrame(
+            columns=[
+                "factor", "mean_IC", "IC_std", "ICIR", "IC_t_stat", "mean_IC_ci_lower",
+                "mean_IC_ci_upper", "positive_IC_ratio", "observations",
+            ]
+        ),
+        "decay": pd.DataFrame(columns=["factor", "horizon_days", "mean_IC", "observations"]),
+        "quantile_returns": pd.DataFrame(
+            columns=[
+                "factor", "date", "low_quantile_return", "high_quantile_return",
+                "high_minus_low_return", "observations",
+            ]
+        ),
+        "similarity": pd.DataFrame(
+            columns=["factor_left", "factor_right", "signal_correlation", "ic_series_correlation"]
+        ),
+        "clusters": pd.DataFrame(columns=["factor", "cluster_id"]),
+        "families": pd.DataFrame(columns=["family", "factor_count", "mean_IC"]),
+        "stability": pd.DataFrame(columns=["factor", "selection_frequency", "stability_score", "window_count"]),
+    }
 
 
 def _signal_frame(factors: list[Any], panel: pd.DataFrame) -> pd.DataFrame:

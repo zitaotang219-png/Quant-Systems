@@ -263,13 +263,7 @@ def _by_date_zscore(panel: pd.DataFrame, values: pd.Series) -> pd.Series:
 
 
 def _rolling_percentile_rank(series: pd.Series, window: int) -> pd.Series:
-    def _rank_last(values: pd.Series) -> float:
-        valid = values.dropna()
-        if valid.empty:
-            return np.nan
-        return float(valid.rank(pct=True).iloc[-1])
-
-    return series.rolling(window=window, min_periods=window).apply(_rank_last, raw=False)
+    return series.rolling(window=window, min_periods=window).rank(method="average", pct=True)
 
 
 def _rolling_correlation(panel: pd.DataFrame, left: pd.Series, right: pd.Series, window: int) -> pd.Series:
@@ -285,10 +279,15 @@ def _rolling_correlation(panel: pd.DataFrame, left: pd.Series, right: pd.Series,
         )
         .sort_values(["symbol", "date"], kind="mergesort")
     )
-    result = ordered.groupby("symbol", sort=False, group_keys=False).apply(
-        lambda frame: frame["_left"].rolling(window=window, min_periods=window).corr(frame["_right"])
+    pairwise = (
+        ordered.groupby("symbol", sort=False)[["_left", "_right"]]
+        .rolling(window=window, min_periods=window)
+        .corr()
     )
-    return result.reindex(panel.index).astype(float)
+    result = pairwise.xs("_left", level=-1)["_right"].droplevel(0)
+    result = result.reindex(panel.index).astype(float)
+    result.name = None
+    return result
 
 
 class _ExpressionParser:
