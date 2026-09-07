@@ -8,6 +8,20 @@ import pandas as pd
 from .config import RegimeConfig, SelectedFactor
 
 
+def cross_sectional_rank_normalize(dates: pd.Series, values: pd.Series) -> pd.Series:
+    """Deterministically rank-center one factor using only each date's cross-section."""
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(dates, utc=False),
+            "value": pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan),
+        },
+        index=values.index,
+    )
+    ranks = frame.groupby("date", sort=False)["value"].rank(method="average", pct=True)
+    centers = ranks.groupby(frame["date"], sort=False).transform("mean")
+    return (2.0 * (ranks - centers)).fillna(0.0).astype(float)
+
+
 def factor_blend_weights(
     factors: list[SelectedFactor],
     weight_scheme: str,
@@ -254,8 +268,12 @@ def build_weight_frame(
         regime_label = None
         if regime_by_date is not None and not regime_by_date.empty:
             regime_label = str(regime_by_date.get(day_date, "bull_low_vol"))
-        day_scores = frame.loc[day_index, "score"]
-        day_vol = frame.loc[day_index, "volatility"]
+        day_symbols = frame.loc[day_index, "symbol"].astype(str)
+        if day_symbols.duplicated().any():
+            raise ValueError(f"Duplicate symbols in portfolio cross-section for {day_date.date()}.")
+        symbol_index = pd.Index(day_symbols.to_numpy(), name="symbol")
+        day_scores = pd.Series(frame.loc[day_index, "score"].to_numpy(dtype=float), index=symbol_index)
+        day_vol = pd.Series(frame.loc[day_index, "volatility"].to_numpy(dtype=float), index=symbol_index)
         target = construct_day_weights(
             score=day_scores,
             volatility=day_vol,
@@ -271,7 +289,7 @@ def build_weight_frame(
         )
         target = _apply_benchmark_follow_overlay(
             target=target,
-            symbols=frame.loc[day_index, "symbol"].astype(str),
+            symbols=pd.Series(symbol_index, index=symbol_index, dtype=str),
             regime_label=regime_label,
             position_limit=position_limit,
             gross_leverage=gross_leverage,
@@ -285,7 +303,7 @@ def build_weight_frame(
         if previous_weights is not None and turnover_limit > 0.0:
             target = apply_turnover_limit(previous_weights, target, turnover_limit)
         previous_weights = target
-        frame.loc[day_index, "weight"] = target.reindex(day_index).fillna(0.0).to_numpy(dtype=float)
+        frame.loc[day_index, "weight"] = target.reindex(symbol_index).fillna(0.0).to_numpy(dtype=float)
 
     return frame[["date", "symbol", "weight"]]
 
@@ -475,6 +493,7 @@ def construct_day_weights(
             short_quantile,
             position_limit=position_limit,
             gross_leverage=gross_leverage,
+            market_neutral=market_neutral,
         )
     else:
         ranked = aligned_score.rank(method="average", pct=True) - 0.5
@@ -484,14 +503,24 @@ def construct_day_weights(
             signal = signal.clip(lower=-float(signal_clip), upper=float(signal_clip))
         if market_neutral and not signal.empty:
             signal = signal - float(signal.mean())
-        target = _weights_from_signal(signal, position_limit=position_limit, gross_leverage=gross_leverage)
+        target = _weights_from_signal(
+            signal,
+            position_limit=position_limit,
+            gross_leverage=gross_leverage,
+            market_neutral=market_neutral,
+        )
 
     if previous_weights is not None and smoothing > 0.0:
         previous = previous_weights.reindex(target.index).fillna(0.0).astype(float)
         target = (float(smoothing) * previous) + ((1.0 - float(smoothing)) * target)
         if market_neutral and not target.empty:
             target = target - float(target.mean())
-        target = _weights_from_signal(target, position_limit=position_limit, gross_leverage=gross_leverage)
+        target = _weights_from_signal(
+            target,
+            position_limit=position_limit,
+            gross_leverage=gross_leverage,
+            market_neutral=market_neutral,
+        )
 
     return target.astype(float)
 
@@ -551,11 +580,17 @@ def _bucket_weights(
     *,
     position_limit: float,
     gross_leverage: float,
+    market_neutral: bool,
 ) -> pd.Series:
     clean = score.replace([np.inf, -np.inf], np.nan)
     ranked = clean.rank(method="average", pct=True)
     long_mask = ranked >= (1.0 - long_quantile)
     short_mask = ranked <= short_quantile
+    finite = clean.dropna()
+    if not finite.empty and not bool(long_mask.any()):
+        long_mask.loc[finite.idxmax()] = True
+    if not finite.empty and not bool(short_mask.any()):
+        short_mask.loc[finite.idxmin()] = True
     weights = pd.Series(0.0, index=score.index, dtype=float)
     long_count = int(long_mask.sum())
     short_count = int(short_mask.sum())
@@ -567,17 +602,48 @@ def _bucket_weights(
         weights,
         position_limit=position_limit,
         gross_leverage=gross_leverage,
+        market_neutral=market_neutral,
     )
 
 
-def _weights_from_signal(signal: pd.Series, position_limit: float, gross_leverage: float) -> pd.Series:
+def _weights_from_signal(
+    signal: pd.Series,
+    position_limit: float,
+    gross_leverage: float,
+    market_neutral: bool = False,
+) -> pd.Series:
     clean = signal.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
     if clean.abs().sum() <= 1e-12:
         return pd.Series(0.0, index=clean.index, dtype=float)
     if position_limit <= 0.0:
         position_limit = gross_leverage
 
-    remaining = float(max(gross_leverage, 0.0))
+    if market_neutral:
+        positive = clean.clip(lower=0.0)
+        negative = (-clean.clip(upper=0.0))
+        positive_count = int((positive > 1e-12).sum())
+        negative_count = int((negative > 1e-12).sum())
+        if positive_count == 0 or negative_count == 0:
+            return pd.Series(0.0, index=clean.index, dtype=float)
+        side_budget = min(
+            float(max(gross_leverage, 0.0)) / 2.0,
+            float(position_limit) * positive_count,
+            float(position_limit) * negative_count,
+        )
+        long_weights = _allocate_capped_side(positive, side_budget, float(position_limit))
+        short_weights = _allocate_capped_side(negative, side_budget, float(position_limit))
+        return (long_weights - short_weights).astype(float)
+
+    return _allocate_capped_side(clean, float(max(gross_leverage, 0.0)), float(position_limit))
+
+
+def _allocate_capped_side(values: pd.Series, budget: float, position_limit: float) -> pd.Series:
+    """Allocate one signed or unsigned signal side under a per-position cap."""
+    clean = values.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    if clean.abs().sum() <= 1e-12 or budget <= 1e-12:
+        return pd.Series(0.0, index=clean.index, dtype=float)
+
+    remaining = float(max(budget, 0.0))
     result = pd.Series(0.0, index=clean.index, dtype=float)
     active = clean.loc[clean.abs() > 1e-12].copy()
     while not active.empty and remaining > 1e-12:
@@ -589,7 +655,7 @@ def _weights_from_signal(signal: pd.Series, position_limit: float, gross_leverag
             break
         capped_values = scaled.loc[capped].apply(lambda value: np.sign(value) * position_limit)
         result.loc[capped_values.index] = capped_values
-        remaining = float(max(gross_leverage - result.abs().sum(), 0.0))
+        remaining = float(max(budget - result.abs().sum(), 0.0))
         active = active.loc[~capped]
 
     return result.astype(float)

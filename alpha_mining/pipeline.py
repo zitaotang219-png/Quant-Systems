@@ -18,7 +18,11 @@ from .evaluation_types import EvaluationResult, VERY_BAD_FITNESS
 from .evaluator import FactorEvaluator, _prepare_panel
 from .gp_generator import GPGenerator
 from .hypothesis import HypothesisCandidate, HypothesisGenerator
-from .portfolio_construction import build_weight_frame, combine_factor_columns
+from .portfolio_construction import (
+    build_weight_frame,
+    combine_factor_columns,
+    cross_sectional_rank_normalize,
+)
 from .research_evaluator import FactorResearchEvaluator, compute_research_fitness
 from .regime import build_regime_frame
 from .registry import FactorRegistry
@@ -75,6 +79,7 @@ class AlphaMiningStrategy:
     regime_benchmark_direction: dict[str, float] | None = None
     regime_config: Any = None
     universe_symbols: tuple[str, ...] = ()
+    normalize_factor_signals: bool = False
 
     def backtest(
         self,
@@ -96,7 +101,11 @@ class AlphaMiningStrategy:
             panel,
             trading_convention=self.evaluator.trading_convention,
         )
-        factor_columns = _evaluate_factor_columns(prepared, self.selected_factors)
+        factor_columns = _evaluate_factor_columns(
+            prepared,
+            self.selected_factors,
+            normalize_cross_sectionally=self.normalize_factor_signals,
+        )
         regime_by_date = _regime_series_for_panel(
             prepared if regime_source_panel is None else _filter_universe(regime_source_panel, self.universe_symbols),
             self.regime_config,
@@ -134,7 +143,11 @@ class AlphaMiningStrategy:
                 max_position_size=self.position_limit,
                 max_leverage=self.gross_leverage,
                 max_gross_exposure=self.gross_leverage,
-                max_net_exposure=self.gross_leverage,
+                max_net_exposure=(
+                    1e-10
+                    if self.market_neutral and not self.benchmark_follow_enabled
+                    else self.gross_leverage
+                ),
             ),
             convention=DEFAULT_TRADING_CONVENTION,
         )
@@ -159,7 +172,11 @@ class AlphaMiningStrategy:
             panel,
             trading_convention=self.evaluator.trading_convention,
         )
-        factor_columns = _evaluate_factor_columns(prepared, self.selected_factors)
+        factor_columns = _evaluate_factor_columns(
+            prepared,
+            self.selected_factors,
+            normalize_cross_sectionally=self.normalize_factor_signals,
+        )
         regime_by_date = _regime_series_for_panel(prepared, self.regime_config)
         weights = _build_combined_weights(
             panel=prepared,
@@ -291,6 +308,8 @@ def build_alpha_mining_strategy(
     panel: pd.DataFrame,
     config: AlphaMiningConfig,
     selected_factors: list[SelectedFactor] | None = None,
+    *,
+    normalize_factor_signals: bool = False,
 ) -> AlphaMiningStrategy:
     panel = _filter_universe(panel, config.universe_symbols)
     resolved_selected = selected_factors if selected_factors is not None else run_alpha_mining(panel, config)
@@ -315,6 +334,7 @@ def build_alpha_mining_strategy(
         regime_benchmark_direction=dict(config.portfolio.regime_benchmark_direction),
         regime_config=config.regime,
         universe_symbols=config.universe_symbols,
+        normalize_factor_signals=normalize_factor_signals,
     )
 
 
@@ -367,9 +387,15 @@ def backtest_selected_factors(
     risk_fraction: float = 0.2,
     output_dir: str | None = None,
     regime_source_panel: pd.DataFrame | None = None,
+    normalize_factor_signals: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, float], dict[str, Any]]:
     filtered_panel = _filter_universe(panel, config.universe_symbols)
-    strategy = build_alpha_mining_strategy(filtered_panel, config, selected_factors=selected_factors)
+    strategy = build_alpha_mining_strategy(
+        filtered_panel,
+        config,
+        selected_factors=selected_factors,
+        normalize_factor_signals=normalize_factor_signals,
+    )
     engine = BacktestEngine(
         initial_capital=initial_capital,
         transaction_cost_bps=(
@@ -978,10 +1004,20 @@ def _is_too_correlated(values: pd.Series, selected_values: Any, threshold: float
     return False
 
 
-def _evaluate_factor_columns(panel: pd.DataFrame, selected_factors: list[SelectedFactor]) -> dict[str, pd.Series]:
+def _evaluate_factor_columns(
+    panel: pd.DataFrame,
+    selected_factors: list[SelectedFactor],
+    *,
+    normalize_cross_sectionally: bool = False,
+) -> dict[str, pd.Series]:
     factor_columns: dict[str, pd.Series] = {}
     for selected in selected_factors:
-        factor_columns[selected.expression] = selected.node.evaluate(panel).astype(float) * float(selected.direction)
+        oriented = selected.node.evaluate(panel).astype(float) * float(selected.direction)
+        factor_columns[selected.expression] = (
+            cross_sectional_rank_normalize(panel["date"], oriented)
+            if normalize_cross_sectionally
+            else oriented
+        )
     return factor_columns
 
 

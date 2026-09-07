@@ -46,6 +46,13 @@ from .pipeline import (
 )
 from .regime import RegimeDetector
 from .registry import FactorRegistry
+from .phase3b import (
+    FrozenFactorSet,
+    build_phase3b_baseline_config,
+    build_phase3b_baseline_strategy,
+    load_frozen_factor_set,
+    run_phase3b_baseline,
+)
 
 __all__ = [
     "FactorNode",
@@ -95,4 +102,9 @@ __all__ = [
     "select_factors_from_pool",
     "backtest_selected_factors",
     "run_walk_forward_evaluation",
+    "FrozenFactorSet",
+    "load_frozen_factor_set",
+    "build_phase3b_baseline_config",
+    "build_phase3b_baseline_strategy",
+    "run_phase3b_baseline",
 ]
