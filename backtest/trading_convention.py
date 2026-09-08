@@ -33,3 +33,15 @@ class TradingConvention:
 
 
 DEFAULT_TRADING_CONVENTION = TradingConvention()
+
+
+CONTINUOUS_CRYPTO_TRADING_CONVENTION = TradingConvention(
+    signal_timestamp="close_t",
+    execution_timestamp="open_t_plus_1",
+    fill_price_rule="next_bar_open_delta_rebalance",
+    holding_period="continuous_across_daily_bar_boundaries",
+    exit_rule="trade_only_target_delta_at_next_rebalance",
+    return_interval="continuous_mark_to_market_including_close_to_next_open",
+    rebalance_frequency="daily",
+    cost_model="commission_plus_spread_slippage_impact_on_executed_delta_only",
+)

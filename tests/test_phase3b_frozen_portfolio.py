@@ -25,6 +25,7 @@ from alpha_mining.run_phase3b_experiment import (
     build_predeclared_variants,
     load_permitted_raw_panel,
 )
+from alpha_mining.run_phase3b_continuous_experiment import compute_frozen_rank_ic_decay
 from alpha_mining.pipeline import _evaluate_factor_columns
 from alpha_mining.portfolio_construction import (
     combine_factor_columns,
@@ -220,3 +221,21 @@ def test_phase3b_predeclared_variants_change_only_authorized_switches(tmp_path: 
         assert config.portfolio.gross_leverage == source.portfolio.gross_leverage
         assert config.portfolio.position_limit == source.portfolio.position_limit
         assert config.portfolio.turnover_limit == source.portfolio.turnover_limit
+
+
+def test_frozen_rank_ic_decay_uses_only_predeclared_horizons_without_mutation(tmp_path: Path) -> None:
+    panel = _panel()
+    _write_registry(tmp_path, panel)
+    frozen = load_frozen_factor_set(tmp_path)
+
+    decay = compute_frozen_rank_ic_decay(panel, frozen)
+
+    assert set(decay["horizon_days"]) == {1, 3, 5, 10}
+    assert set(decay["expression"]) == {"signal_a", "signal_b", "equal_factor_composite"}
+    assert set(decay["return_interval"]) == {
+        "open_t+1_to_close_t+1",
+        "open_t+1_to_close_t+3",
+        "open_t+1_to_close_t+5",
+        "open_t+1_to_close_t+10",
+    }
+    frozen.verify_unchanged()

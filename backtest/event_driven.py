@@ -12,8 +12,17 @@ from backtest.events import AccountingEvent, FillEvent, MarketEvent, OrderEvent,
 from backtest.ledger import CashLedger, PortfolioLedger
 from backtest.portfolio_constraints import PortfolioConstraints, validate_target_weights
 from backtest.reconciliation import build_reconciliation_frame
-from backtest.trading_convention import DEFAULT_TRADING_CONVENTION, TradingConvention
-from backtest.turnover import DEFAULT_TURNOVER_CONVENTION, TurnoverConvention
+from backtest.trading_convention import (
+    CONTINUOUS_CRYPTO_TRADING_CONVENTION,
+    DEFAULT_TRADING_CONVENTION,
+    TradingConvention,
+)
+from backtest.turnover import (
+    CONTINUOUS_CRYPTO_TURNOVER_CONVENTION,
+    DEFAULT_TURNOVER_CONVENTION,
+    ContinuousRebalanceTurnoverConvention,
+    TurnoverConvention,
+)
 from execution.cost_model import TransactionCostModel
 
 
@@ -214,4 +223,203 @@ class EventDrivenPortfolioBacktester:
             timeseries=pd.DataFrame(), trades=pd.DataFrame(), reconciliation=pd.DataFrame(),
             turnover=pd.DataFrame(), constraints=pd.DataFrame(), events=[],
             ledger=PortfolioLedger(cash=CashLedger(balance=self.initial_capital)),
+        )
+
+
+class ContinuousCryptoPortfolioBacktester:
+    """Daily delta rebalancing while positions remain live across 24/7 bar boundaries."""
+
+    def __init__(
+        self,
+        *,
+        initial_capital: float,
+        cost_model: TransactionCostModel,
+        constraints: PortfolioConstraints,
+        convention: TradingConvention = CONTINUOUS_CRYPTO_TRADING_CONVENTION,
+        turnover_convention: ContinuousRebalanceTurnoverConvention = CONTINUOUS_CRYPTO_TURNOVER_CONVENTION,
+    ) -> None:
+        self.initial_capital = float(initial_capital)
+        self.cost_model = cost_model
+        self.constraints = constraints
+        self.convention = convention
+        self.turnover_convention = turnover_convention
+
+    def run(self, panel: pd.DataFrame, target_weights: pd.DataFrame) -> EventDrivenBacktestResult:
+        required = {"date", "symbol", "open", "close"}
+        missing = required.difference(panel.columns)
+        if missing:
+            raise KeyError(f"Panel is missing required execution columns: {sorted(missing)}")
+        if target_weights.empty:
+            return EventDrivenPortfolioBacktester(
+                initial_capital=self.initial_capital,
+                cost_model=self.cost_model,
+                constraints=self.constraints,
+            )._empty_result()
+
+        prices = panel[["date", "symbol", "open", "close"]].copy()
+        prices["date"] = pd.to_datetime(prices["date"], utc=False)
+        prices["symbol"] = prices["symbol"].astype(str)
+        prices["open"] = pd.to_numeric(prices["open"], errors="coerce")
+        prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+        prices = prices.dropna(subset=["open", "close"]).sort_values(["date", "symbol"], kind="mergesort")
+
+        signals = target_weights[["date", "symbol", "weight"]].copy()
+        signals["date"] = pd.to_datetime(signals["date"], utc=False)
+        signals["symbol"] = signals["symbol"].astype(str)
+        signals["weight"] = pd.to_numeric(signals["weight"], errors="coerce").fillna(0.0)
+        dates = list(pd.Index(prices["date"].drop_duplicates()).sort_values())
+        signal_by_date = {
+            date: group.set_index("symbol")["weight"].to_dict()
+            for date, group in signals.groupby("date", sort=False)
+        }
+
+        ledger = PortfolioLedger(cash=CashLedger(balance=self.initial_capital))
+        positions = ledger.positions
+        trades = ledger.trades
+        event_log: list[dict[str, Any]] = []
+        time_rows: list[dict[str, Any]] = []
+        reconciliation_rows: list[dict[str, object]] = []
+        turnover_rows: list[dict[str, object]] = []
+        constraint_rows: list[dict[str, object]] = []
+
+        for index in range(1, len(dates)):
+            signal_date = dates[index - 1]
+            execution_date = dates[index]
+            day = prices.loc[prices["date"] == execution_date].set_index("symbol")
+            weights = {
+                symbol: float(weight)
+                for symbol, weight in signal_by_date.get(signal_date, {}).items()
+                if symbol in day.index
+            }
+            held_symbols = {
+                symbol for symbol, position in positions.positions.items() if abs(position.units) > 1e-12
+            }
+            missing_held = held_symbols.difference(day.index.astype(str))
+            if missing_held:
+                raise ValueError(
+                    "Cannot mark or rebalance continuously held symbols without current prices: "
+                    f"{sorted(missing_held)}"
+                )
+            constraint = validate_target_weights(weights, self.constraints)
+            constraint_rows.append({"date": execution_date, "signal_date": signal_date, **constraint.to_dict()})
+            if not constraint.passed:
+                raise ValueError(f"Portfolio constraints violated on {execution_date.date()}: {constraint.violations}")
+
+            market_prices = {
+                symbol: {"open": float(row["open"]), "close": float(row["close"])}
+                for symbol, row in day.iterrows()
+            }
+            event_log.append(event_to_dict(MarketEvent(timestamp=execution_date, prices=market_prices)))
+            event_log.append(event_to_dict(SignalEvent(timestamp=signal_date, target_weights=weights)))
+
+            starting_equity = ledger.equity
+            positions.mark_to_market({symbol: prices_["open"] for symbol, prices_ in market_prices.items()})
+            pretrade_equity = ledger.equity
+            gap_pnl = pretrade_equity - starting_equity
+            executed_notional = 0.0
+            commission_cost = 0.0
+            execution_cost = 0.0
+            total_cost = 0.0
+
+            rebalance_symbols = set(weights).union(held_symbols)
+            for symbol in sorted(rebalance_symbols):
+                open_price = float(day.at[symbol, "open"])
+                target_units = (pretrade_equity * float(weights.get(symbol, 0.0))) / open_price
+                current_units = positions.positions.get(symbol).units if symbol in positions.positions else 0.0
+                quantity = target_units - current_units
+                signed_notional = quantity * open_price
+                if abs(signed_notional) <= 1e-10:
+                    continue
+                costs = self.cost_model.estimate(signed_notional)
+                event_log.append(event_to_dict(OrderEvent(execution_date, symbol, quantity, open_price, "rebalance_delta")))
+                ledger.cash.apply_trade(signed_notional, costs.total_cost)
+                position = positions.apply_fill(symbol, quantity, open_price)
+                trades.record(
+                    timestamp=execution_date,
+                    symbol=symbol,
+                    side="BUY" if quantity > 0.0 else "SELL",
+                    quantity=quantity,
+                    price=open_price,
+                    fee=costs.commission,
+                    slippage=costs.slippage_cost,
+                    spread=costs.spread_cost,
+                    market_impact=costs.impact_cost,
+                    reason="rebalance_delta",
+                )
+                event_log.append(
+                    event_to_dict(
+                        FillEvent(
+                            execution_date,
+                            symbol,
+                            quantity,
+                            open_price,
+                            costs.commission,
+                            costs.slippage_cost,
+                            "rebalance_delta",
+                        )
+                    )
+                )
+                event_log.append(event_to_dict(PositionEvent(execution_date, symbol, position.units, position.market_value)))
+                executed_notional += abs(signed_notional)
+                commission_cost += costs.commission
+                execution_cost += costs.spread_cost + costs.slippage_cost + costs.impact_cost
+                total_cost += costs.total_cost
+
+            posttrade_equity = ledger.equity
+            positions.mark_to_market({symbol: prices_["close"] for symbol, prices_ in market_prices.items()})
+            ending_equity = ledger.equity
+            intraday_pnl = ending_equity - posttrade_equity
+            gross_pnl = gap_pnl + intraday_pnl
+            difference = ending_equity - (starting_equity + gross_pnl - total_cost)
+            event_log.append(event_to_dict(AccountingEvent(execution_date, starting_equity, gross_pnl, total_cost, ending_equity)))
+            reconciliation_rows.append(
+                {
+                    "date": execution_date,
+                    "starting_equity": starting_equity,
+                    "gross_pnl": gross_pnl,
+                    "fees": commission_cost,
+                    "slippage": execution_cost,
+                    "ending_equity": ending_equity,
+                    "difference": difference,
+                }
+            )
+            turnover_row = {
+                "date": execution_date,
+                "signal_date": signal_date,
+                **self.turnover_convention.report(starting_equity, executed_notional),
+            }
+            turnover_rows.append(turnover_row)
+            time_rows.append(
+                {
+                    "date": execution_date,
+                    "signal_date": signal_date,
+                    "gap_pnl": gap_pnl,
+                    "intraday_pnl": intraday_pnl,
+                    "gross_pnl": gross_pnl,
+                    "total_cost": total_cost,
+                    "gross_return": 0.0 if starting_equity == 0.0 else gross_pnl / starting_equity,
+                    "transaction_cost": 0.0 if starting_equity == 0.0 else total_cost / starting_equity,
+                    "net_return": 0.0 if starting_equity == 0.0 else (ending_equity / starting_equity) - 1.0,
+                    "equity_curve": ending_equity,
+                    "cash": ledger.cash.balance,
+                    "market_value": positions.market_value,
+                    "turnover": turnover_row["turnover"],
+                    "pnl": ending_equity - starting_equity,
+                }
+            )
+
+        timeseries = pd.DataFrame(time_rows)
+        timeseries["drawdown"] = (
+            (timeseries["equity_curve"] / timeseries["equity_curve"].cummax()) - 1.0
+            if not timeseries.empty
+            else pd.Series(dtype=float)
+        )
+        return EventDrivenBacktestResult(
+            timeseries=timeseries,
+            trades=pd.DataFrame(trades.trades),
+            reconciliation=build_reconciliation_frame(reconciliation_rows),
+            turnover=pd.DataFrame(turnover_rows),
+            constraints=pd.DataFrame(constraint_rows),
+            events=event_log,
+            ledger=ledger,
         )

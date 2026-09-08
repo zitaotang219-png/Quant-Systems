@@ -7,10 +7,10 @@ import numpy as np
 import pandas as pd
 
 from backtest.engine import BacktestEngine
-from backtest.event_driven import EventDrivenPortfolioBacktester
+from backtest.event_driven import ContinuousCryptoPortfolioBacktester, EventDrivenPortfolioBacktester
 from backtest.ledger import PortfolioLedger
 from backtest.portfolio_constraints import PortfolioConstraints
-from backtest.trading_convention import DEFAULT_TRADING_CONVENTION
+from backtest.trading_convention import CONTINUOUS_CRYPTO_TRADING_CONVENTION, DEFAULT_TRADING_CONVENTION
 from execution.cost_model import TransactionCostModel
 
 from .config import AlphaMiningConfig, SelectedFactor, get_compute_profile
@@ -88,6 +88,7 @@ class AlphaMiningStrategy:
         transaction_cost_bps: float,
         slippage_bps: float = 0.0,
         regime_source_panel: pd.DataFrame | None = None,
+        execution_mode: str = "flat_session",
     ) -> PortfolioBacktestResult:
         panel = _filter_universe(panel, self.universe_symbols)
         if not self.selected_factors:
@@ -133,7 +134,13 @@ class AlphaMiningStrategy:
             regime_by_date=regime_by_date,
             regime_config=self.regime_config,
         )
-        backtester = EventDrivenPortfolioBacktester(
+        backtester_class = {
+            "flat_session": EventDrivenPortfolioBacktester,
+            "continuous_crypto": ContinuousCryptoPortfolioBacktester,
+        }.get(execution_mode)
+        if backtester_class is None:
+            raise ValueError(f"Unknown execution mode: {execution_mode!r}")
+        backtester = backtester_class(
             initial_capital=initial_capital,
             cost_model=TransactionCostModel(
                 commission_bps=transaction_cost_bps,
@@ -149,7 +156,11 @@ class AlphaMiningStrategy:
                     else self.gross_leverage
                 ),
             ),
-            convention=DEFAULT_TRADING_CONVENTION,
+            convention=(
+                DEFAULT_TRADING_CONVENTION
+                if execution_mode == "flat_session"
+                else CONTINUOUS_CRYPTO_TRADING_CONVENTION
+            ),
         )
         accounting = backtester.run(prepared, weights)
         return PortfolioBacktestResult(
@@ -160,7 +171,7 @@ class AlphaMiningStrategy:
             turnover_report=accounting.turnover,
             constraint_report=accounting.constraints,
             events=accounting.events,
-            trading_convention=DEFAULT_TRADING_CONVENTION.to_dict(),
+            trading_convention=backtester.convention.to_dict(),
             ledger=accounting.ledger,
         )
 
@@ -388,6 +399,7 @@ def backtest_selected_factors(
     output_dir: str | None = None,
     regime_source_panel: pd.DataFrame | None = None,
     normalize_factor_signals: bool = False,
+    execution_mode: str = "flat_session",
 ) -> tuple[pd.DataFrame, dict[str, float], dict[str, Any]]:
     filtered_panel = _filter_universe(panel, config.universe_symbols)
     strategy = build_alpha_mining_strategy(
@@ -414,7 +426,10 @@ def backtest_selected_factors(
         filtered_panel,
         strategy,
         output_dir=output_dir,
-        strategy_backtest_kwargs={"regime_source_panel": regime_source_panel},
+        strategy_backtest_kwargs={
+            "regime_source_panel": regime_source_panel,
+            "execution_mode": execution_mode,
+        },
     )
 
 

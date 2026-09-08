@@ -31,3 +31,24 @@ class TurnoverConvention:
 
 
 DEFAULT_TURNOVER_CONVENTION = TurnoverConvention()
+
+
+@dataclass(frozen=True)
+class ContinuousRebalanceTurnoverConvention:
+    """Turnover from actual delta trades in a continuously held portfolio."""
+
+    name: str = "continuous_crypto_executed_delta"
+
+    def report(self, starting_equity: float, executed_delta_notional: float) -> dict[str, float | str]:
+        turnover = 0.0 if starting_equity == 0.0 else abs(float(executed_delta_notional)) / float(starting_equity)
+        return {
+            "convention": self.name,
+            "executed_delta_turnover": turnover,
+            "turnover": turnover,
+        }
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+CONTINUOUS_CRYPTO_TURNOVER_CONVENTION = ContinuousRebalanceTurnoverConvention()
